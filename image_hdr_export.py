@@ -59,7 +59,8 @@ def capabilities():
     except (ValueError, OSError) as error:
         heic, heic_reason = False, str(error)
     from image_extra_codecs import capabilities as extra_capabilities
-    return dict(avif=avif, heic=dict(available=heic, alpha=heic, reason=heic_reason),**extra_capabilities())
+    heif = dict(available=heic, alpha=heic, reason=heic_reason)
+    return dict(avif=avif, heic=heif, heif=dict(heif), **extra_capabilities())
 
 
 def validate_request(settings, fmt, path, preserve_alpha):
@@ -70,7 +71,7 @@ def validate_request(settings, fmt, path, preserve_alpha):
         raise ValueError('HDR 图片保存需要在渲染链中开启 TrueHDR；普通 SDR 不能直接标记为 HDR')
     info = capabilities().get(fmt)
     if not info or not info['available']:
-        raise ValueError(info['reason'] if info else 'HDR 图片请选择 AVIF、HEIC、UHDR 或 JXL')
+        raise ValueError(info['reason'] if info else 'HDR 图片请选择 AVIF、HEIC、HEIF、UHDR 或 JXL')
     if preserve_alpha and not info['alpha'] and np.any(read_rgba(path)[:, :, 3] != 255):
         raise ValueError('当前 HDR 图片编码器不支持透明度，请更换格式或关闭保留透明度')
 

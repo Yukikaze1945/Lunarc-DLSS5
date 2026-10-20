@@ -3,6 +3,7 @@ import {ui} from '../i18n/locale'
 import {useEffect, useRef, useState} from 'react'
 import {FolderOpen, RefreshCw, Trash2} from 'lucide-react'
 import {runtimeRequest, type DlssnrStatus, type DlssnrVersion} from '../services/api'
+import {runtimeIdentityNotice} from '../services/runtimeNotice'
 import './dlssnrRuntime.css'
 
 const phases: Record<string, string> = {copying: '复制中', downloading: '下载中', verifying: '校验中', extracting: '解包中'}
@@ -20,7 +21,6 @@ export function DlssnrRuntimePanel() {
   const [confirmed, setConfirmed] = useState(false)
   const [archiveSha, setArchiveSha] = useState('')
   const [communityApproved, setCommunityApproved] = useState(false)
-  const [experimental, setExperimental] = useState(false)
   const refreshRevision = useRef(0)
   const refresh = async () => {
     const revision = ++refreshRevision.current
@@ -37,12 +37,13 @@ export function DlssnrRuntimePanel() {
     if (busy) return
     setBusy(true); setError(''); setMessage('')
     let completed = false
-    try {await action(); completed = true}
+    let result:unknown
+    try {result=await action();completed = true}
     catch (e: any) {setError(e.message)}
-    finally {try {await refresh(); if (completed) setMessage(success)} catch (e: any) {setError(e.message)} setBusy(false)}
+    finally {try {await refresh(); if (completed) setMessage(runtimeIdentityNotice(result)??success)} catch (e: any) {setError(e.message)} setBusy(false)}
   }
   async function importPath(value: string) {
-    if (value) await run(() => runtimeRequest<DlssnrVersion>('/import', 'POST', {path: value}), '已校验并缓存，请选择使用版本。')
+    if (value) await run(() => runtimeRequest<DlssnrVersion>('/import', 'POST', {path: value}), '已导入并使用该运行库。')
   }
   async function chooseFile() {
     try {
@@ -60,7 +61,7 @@ export function DlssnrRuntimePanel() {
     if (value) {setPath(value); void importPath(value)} else setError('无法取得文件路径，请选择文件或粘贴本机路径')
   }}>
     <div className="environment-heading"><h2>{ui("DLSSNR 运行库")}</h2><button className="button" disabled={busy} onClick={() => void run(refresh, '')}><RefreshCw size={15}/>{ui("刷新")}</button></div>
-    <div className="runtime-current"><strong>{ui(state?.active ? `版本 ${state.active.version}` : '尚未选择')}</strong><span>{ui(state?.active && !state.error ? 'NVIDIA 签名有效 · SHA-256 已校验' : state?.error?.message)}</span></div>
+    <div className="runtime-current"><strong>{ui(state?.active ? `版本 ${state.active.version}` : '尚未选择')}</strong><span>{ui(state?.active && !state.error ? state.active.trust==='unrecognized'?'未识别身份 DLL':state.active.trust==='pinned_community'?'社区兼容版 · 无有效 NVIDIA 签名 · SHA-256 已匹配':'NVIDIA 签名有效 · SHA-256 已校验' : state?.error?.message)}</span></div>
     <div className="runtime-import">
       <input aria-label={ui("DLSSNR DLL 或 ZIP 路径")} value={path} onChange={e => setPath(e.target.value)} placeholder={ui("拖入 DLL / ZIP，或粘贴本机路径")} disabled={busy}/>
       {ui(window.electronAPI?.openRuntimeDialog && <button className="button" disabled={busy} onClick={() => void chooseFile()}><FolderOpen size={15}/>{ui("选择文件")}</button>)}
@@ -68,16 +69,16 @@ export function DlssnrRuntimePanel() {
     </div>
     {ui(state?.legacy_path && !state.versions.length && <button className="button quiet" disabled={busy} onClick={() => void importPath(state.legacy_path!)}>{ui("导入本机已有运行库")}</button>)}
     <div className="runtime-versions">{ui(state?.versions.map(v => <div className="runtime-version" key={v.id}>
-      <div><strong>{ui(v.version)}</strong><code title={v.sha256}>{v.sha256.slice(0, 12)}…</code><span>{ui(v.compatibility === 'known' ? '已核对版本' : '未验收版本')}</span></div>
-      <div className="runtime-actions"><button className="button" disabled={busy || state.active?.id === v.id && !state.error || v.compatibility !== 'known' && !experimental} onClick={() => void run(() => runtimeRequest('/activate', 'POST', {id: v.id, allow_unrecognized: experimental}), '已选择，新会话使用该版本。')}>{ui(state.active?.id === v.id ? '已选择' : '使用')}</button><button className="button quiet" disabled={busy || state.active?.id === v.id} aria-label={ui(`删除版本 ${v.version}`)} onClick={() => void run(() => runtimeRequest(`/versions/${v.id}`, 'DELETE'), '缓存版本已删除。')}><Trash2 size={15}/></button></div>
+      <div><strong>{ui(v.version)}</strong><code title={v.sha256}>{v.sha256.slice(0, 12)}…</code><span>{ui(v.trust==='unrecognized'?'未识别身份 DLL':v.trust==='pinned_community'?'社区兼容版 · 未签名／签名失效':v.compatibility === 'known' ? '已核对版本' : '未验收版本')}</span></div>
+      <div className="runtime-actions"><button className="button" disabled={busy || state.active?.id === v.id && !state.error} onClick={() => void run(async() => {await runtimeRequest('/activate', 'POST', {id: v.id});return v}, '已选择，新会话使用该版本。')}>{ui(state.active?.id === v.id ? '已选择' : '使用')}</button><button className="button quiet" disabled={busy || state.active?.id === v.id} aria-label={ui(`删除版本 ${v.version}`)} onClick={() => void run(() => runtimeRequest(`/versions/${v.id}`, 'DELETE'), '缓存版本已删除。')}><Trash2 size={15}/></button></div>
     </div>))}</div>
-    {ui(state?.active && <div className="runtime-actions"><button className="button quiet" disabled={busy} onClick={() => void run(() => runtimeRequest('/verify', 'POST', {id: state.active!.id}), '文件哈希与数字签名检查通过。')}>{ui("重新校验")}</button><button className="button quiet" disabled={busy} onClick={() => void run(() => runtimeRequest('/activate', 'POST', {id: null}), '已取消选择。')}>{ui("取消选择")}</button></div>)}
+    {ui(state?.active && <div className="runtime-actions"><button className="button quiet" disabled={busy} onClick={() => void run(() => runtimeRequest('/verify', 'POST', {id: state.active!.id}), '运行库身份与文件哈希检查通过。')}>{ui("重新校验")}</button><button className="button quiet" disabled={busy} onClick={() => void run(() => runtimeRequest('/activate', 'POST', {id: null}), '已取消选择。')}>{ui("取消选择")}</button></div>)}
     <details><summary>{ui("版本目录与下载")}</summary>
       <label className="runtime-consent"><input type="checkbox" checked={communityApproved} disabled={busy} onChange={e => setCommunityApproved(e.target.checked)}/>{ui("我确认使用 Feeder 所用的社区来源，并有权取得和使用运行库")}</label>
-      {ui(state?.catalog.map(v => <div className="runtime-version" key={v.id}><div><strong>{ui(v.version)}</strong><span>{ui(v.source)}</span></div><button className="button" disabled={busy || !communityApproved || v.downloaded} onClick={() => void run(() => runtimeRequest('/import', 'POST', {catalog_id: v.id, confirmed: communityApproved}), '已下载、解包并校验，请选择使用版本。')}>{ui(v.downloaded ? '已缓存' : '下载')}</button></div>))}
+      {ui(state?.catalog.map(v => <div className="runtime-version" key={v.id}><div><strong>{ui(v.version)}</strong><span>{ui(v.source)}</span></div><button className="button" disabled={busy || !communityApproved || v.downloaded} onClick={() => void run(() => runtimeRequest('/import', 'POST', {catalog_id: v.id, confirmed: communityApproved}), '已下载并使用该运行库。')}>{ui(v.downloaded ? '已缓存' : '下载')}</button></div>))}
     </details>
     <details><summary>{ui("可信来源")}</summary>
-      {ui(state?.sources.map(source => <div className="runtime-source" key={source.id}><div><strong>{source.label}</strong><span title={ui(source.location)}>{ui(source.location)}</span></div><div className="runtime-actions"><button className="button" disabled={busy} onClick={() => void run(() => runtimeRequest('/import', 'POST', {source_id: source.id}), '已校验并缓存，请选择使用版本。')}>{ui(source.kind === 'download' ? '下载并校验' : '导入')}</button><button className="button quiet" disabled={busy} aria-label={ui(`移除来源 ${source.label}`)} onClick={() => void run(() => runtimeRequest(`/sources/${source.id}`, 'DELETE'), '来源已移除。')}><Trash2 size={15}/></button></div></div>))}
+      {ui(state?.sources.map(source => <div className="runtime-source" key={source.id}><div><strong>{source.label}</strong><span title={ui(source.location)}>{ui(source.location)}</span></div><div className="runtime-actions"><button className="button" disabled={busy} onClick={() => void run(() => runtimeRequest('/import', 'POST', {source_id: source.id}), '已导入并使用该运行库。')}>{ui(source.kind === 'download' ? '下载并校验' : '导入')}</button><button className="button quiet" disabled={busy} aria-label={ui(`移除来源 ${source.label}`)} onClick={() => void run(() => runtimeRequest(`/sources/${source.id}`, 'DELETE'), '来源已移除。')}><Trash2 size={15}/></button></div></div>))}
       <fieldset disabled={busy} className="runtime-source-form"><legend>{ui("添加来源")}</legend>
         <label>{ui("类型")}<select value={kind} onChange={e => {setKind(e.target.value as typeof kind); setLocation(''); setConfirmed(false)}}><option value="directory">{ui("本机目录")}</option><option value="download">{ui("HTTPS 下载")}</option></select></label>
         <label>{ui("名称")}<input value={label} maxLength={120} onChange={e => setLabel(e.target.value)} placeholder={ui("来源名称")}/></label>
@@ -89,7 +90,6 @@ export function DlssnrRuntimePanel() {
       </fieldset>
       <p>{ui("下载需提供 DLL 哈希；ZIP 还需包哈希。目录内导入 nvngx_dlssnr.dll。")}</p>
     </details>
-    {ui(state?.versions.some(v => v.compatibility !== 'known') && <details><summary>{ui("未验收版本")}</summary><label className="runtime-consent"><input type="checkbox" checked={experimental} disabled={busy} onChange={e => setExperimental(e.target.checked)}/>{ui("允许实验性使用签名有效的未验收版本")}</label><p>{ui("仍校验 NVIDIA 签名与固定哈希；模型接口和画质尚未验收。")}</p></details>)}
     <details><summary>{ui("缓存与许可")}</summary><p className="runtime-path">{ui(state?.cache_dir)}</p>{ui(state?.active?.path && <p className="runtime-path">{ui("当前文件：")}{ui(state.active.path)}</p>)}{ui(state?.active && <p className="runtime-path">SHA-256：{ui(state.active.sha256)}</p>)}<p>{ui("运行库由用户提供，仍受 NVIDIA 原许可约束。签名校验不代表再分发授权或设备兼容性。")}</p></details>
     {ui(busy && <div className="runtime-actions"><p role="status">{ui(phases[operation?.phase || ''] || '处理中')}{ui(operation?.total ? ` · ${Math.round(operation.received / operation.total * 100)}%` : '…')}</p><button className="button quiet" onClick={() => void runtimeRequest('/cancel', 'POST').catch(e => setError(e.message))}>{ui("取消")}</button></div>)}
     {ui(error ? <p role="alert" className="runtime-error">{ui(error)}</p> : message && <p role="status">{ui(message)}</p>)}

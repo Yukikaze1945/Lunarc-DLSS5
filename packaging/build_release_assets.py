@@ -21,7 +21,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--version', default='1.3.0')
+    parser.add_argument('--version', default='1.4.0')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     setup = args.input / f'Lunarc-{args.version}-x64-Setup.exe'

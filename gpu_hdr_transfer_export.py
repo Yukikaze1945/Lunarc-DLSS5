@@ -76,6 +76,7 @@ import bundle_paths
 import gpu_transfer_export as gtx
 import hdr_gpu_engine as hdr
 import pipeline
+from native_watchdog import phase as native_phase
 from layer_settings import layer_parameters, resolve_layer_settings
 
 NATIVE_DIR = bundle_paths.native_dir()
@@ -624,7 +625,10 @@ def load_sdr10_capabilities(bridges, width=None, height=None, codec=HDR_CODEC):
 
 def sdr10_source(source):
     """Only the SDR domain with implemented colour math; never infer HDR from depth."""
-    return (source.get("pix_fmt") == "yuv420p10le"
+    supported_format = (source.get("pix_fmt") == "yuv420p10le" or
+        (str(source.get("codec_name", "")).lower() == "prores" and
+         source.get("pix_fmt") == "yuv422p10le"))
+    return (supported_format
             and source.get("color_transfer") == "bt709"
             and source.get("color_primaries") == "bt709"
             and source.get("color_space") == "bt709"
@@ -724,6 +728,9 @@ def plan_hdr_encoder(transcode_settings, cq: int, source: dict,
     installed entry reported them, so this file hardcodes no FFmpeg enumerator.
     """
     ts = dict(transcode_settings or {})
+    if str(ts.get("codec", "")).lower() in ("prores_ks", "prores"):
+        from prores_export import encoder_plan
+        return encoder_plan(ts, source)
     unsupported = []
     codec = str(ts.get("codec", HDR_CODEC))
     profile = P010_PROFILES.get(codec, '')
@@ -1161,8 +1168,12 @@ def negotiate_hdr(dims: dict, source: dict, job_settings, transcode_settings,
             validate((dst_w, dst_h), ts.get('scale_algorithm', 'lanczos'))
         except ValueError as exc:
             reasons.append(str(exc))
+    prores_source = (str(source.get("codec_name", "")).lower() == "prores" and
+                     str(source.get("pix_fmt", "")).lower() == "yuv422p10le")
+    # The requested output codec is independent of the input decoder codec.
+    prores_output = str(ts.get("codec", "")).lower() in ("prores_ks", "prores")
     if src_w % 2 or src_h % 2:
-        reasons.append("source dimensions must both be even (4:2:0 at full size)")
+        reasons.append("source dimensions must both be even (the working colour bridge requires even extents)")
 
     # The layer vector is validated by the same helper the SDR backend validates its
     # own with, so a duplicated percentage, an illegal weight or a tolerance the
@@ -1183,14 +1194,20 @@ def negotiate_hdr(dims: dict, source: dict, job_settings, transcode_settings,
     if source.get("video_stream_count") != 1:
         reasons.append(f"{source.get('video_stream_count')} video streams: the "
                        "decoder bridge opens exactly one")
-    if source.get("pix_fmt") not in HDR_SOURCE_PIX_FMTS:
+    if source.get("pix_fmt") not in HDR_SOURCE_PIX_FMTS and not prores_source:
         reasons.append(
-            f"pix_fmt={source.get('pix_fmt')}: the HDR chain needs a 10-bit 4:2:0 "
-            f"source ({', '.join(HDR_SOURCE_PIX_FMTS)}) because that is what NVDEC "
-            "yields as P010 and what the encode writes back")
+            f"pix_fmt={source.get('pix_fmt')}: the HDR chain needs a supported 10-bit "
+            "source (P010 4:2:0 or ProRes yuv422p10le 4:2:2)")
     transfer = str(source.get("color_transfer") or "")
     if sdr10:
-        if not sdr10_source(source):
+        if prores_source:
+            valid_prores_sdr = (source.get("color_range") in ("tv", "mpeg", "limited") and
+                source.get("color_primaries") == "bt709" and
+                source.get("color_transfer") == "bt709" and
+                source.get("color_space") == "bt709")
+            if not valid_prores_sdr:
+                reasons.append("ProRes SDR10 requires explicit limited-range BT.709 range, primaries, transfer and matrix tags")
+        elif not sdr10_source(source):
             reasons.append("SDR10 requires explicitly tagged limited-range BT.709 "
                            "10-bit 4:2:0 input; PQ/HLG or unspecified colour is refused")
     elif transfer in HLG_TRANSFERS:
@@ -1238,7 +1255,10 @@ def negotiate_hdr(dims: dict, source: dict, job_settings, transcode_settings,
                 "insists on")
 
     container = os.path.splitext(str(out_path).lower())[1]
-    if container != HDR_CONTAINER:
+    if prores_output:
+        if container != ".mov":
+            reasons.append(f"ProRes output container {container or '(none)'} must be .mov")
+    elif container != HDR_CONTAINER:
         reasons.append(
             f"output container {container or '(none)'}: the HDR encode entry writes "
             f"one video stream into {HDR_CONTAINER}, which is also the intermediate "
@@ -1306,6 +1326,12 @@ def negotiate_hdr(dims: dict, source: dict, job_settings, transcode_settings,
             preserve_source_detail=(layers != 1 or bool(js.get('residual_pyramid', True))))
         if source.get('colour_resolution'):
             policy['source_colour_resolution'] = source['colour_resolution']
+    if prores_output:
+        policy.update(encoder="PyAV/libavcodec ProRes 422 HQ",
+                      static_metadata="not authored by the ProRes software encoder")
+    if prores_source:
+        plan["_source"] = source
+    contract_struct = plan["struct"]
     return {"supported": not reasons, "reasons": reasons, "plan": plan,
             "fps": fps, "guidance_mode": guidance_mode, "uses_flow": uses_flow,
             "downscaled": (live_w, live_h) != (src_w, src_h),
@@ -1316,11 +1342,11 @@ def negotiate_hdr(dims: dict, source: dict, job_settings, transcode_settings,
             "hdr_policy": policy,
             "hdr_encoder_contract_declared": {
                 "codec": plan["codec"], "profile": plan["profile"],
-                "sw_pixel_format": plan["struct"]["sw_pixel_format"],
-                "color_range": plan["struct"]["color_range"],
-                "color_primaries": plan["struct"]["color_primaries"],
-                "color_trc": plan["struct"]["color_trc"],
-                "color_space": plan["struct"]["color_space"]},
+                "sw_pixel_format": contract_struct.get("sw_pixel_format"),
+                "color_range": contract_struct.get("color_range"),
+                "color_primaries": contract_struct.get("color_primaries"),
+                "color_trc": contract_struct.get("color_trc"),
+                "color_space": contract_struct.get("color_space")},
             "hdr_caps": {key: caps.get(key) for key in
                          ("nvdec", "nvenc", "defaults_rc", "encoder_defaults",
                           "sei_capability", "capability", "colour_bridge",
@@ -1352,6 +1378,7 @@ class HdrChain:
         self.b = bridges
         self.caps = hdr_caps
         self.video = video
+        self.source = {}
         self.encoder_output = encoder_output
         self.preview_consumer = preview_consumer
         self.live = live
@@ -1359,6 +1386,15 @@ class HdrChain:
         self.fps = fps
         self.policy = dict(policy or {})
         self.sdr10 = self.policy.get("colour_mode") == "sdr10_bt709"
+        from prores_decode import is_prores
+        self.source = dict(plan.get("_source", (hdr_caps or {}).get("_prores_source", {})) or {})
+        self.prores_input = is_prores(self.source)
+        self.prores_output_enabled = str(plan.get("codec", "")).lower() == "prores_ks"
+        self.prores_decoder = None
+        self.prores_output = None
+        if self.prores_output_enabled and preview_consumer is None:
+            from prores_export import ProResOutput
+            self.prores_output = ProResOutput(self)
         self.bridge_type = hdr.GpuSdr10Bridge if self.sdr10 else hdr.GpuHdrBridge
         self.flow_provider = flow_provider
         self.uses_flow = bool(uses_flow)
@@ -1418,6 +1454,11 @@ class HdrChain:
     # -- lifetime -------------------------------------------------------------
 
     def open_decoder(self):
+        if self.prores_input:
+            from prores_decode import ProResDecoder
+            self.prores_decoder = ProResDecoder(self.video, self.source)
+            self.decoder = self.prores_decoder
+            return
         handle = C.c_void_p()
         opener = ("nvdec_bridge_open_p010" if self.sdr10 else "nvdec_bridge_open_hdr")
         code = int(getattr(self.b["nvdec"], opener)(os.fsencode(self.video),
@@ -1427,10 +1468,24 @@ class HdrChain:
         self.decoder = handle
 
     def next_frame(self, frame):
+        if self.prores_input:
+            return int(self.prores_decoder.next(frame))
         return int(self.b["nvdec"].nvdec_bridge_next(self.decoder, C.byref(frame)))
 
+    def seek_decoder(self, relative_us):
+        if self.prores_input:
+            self.prores_decoder.seek_us(relative_us)
+            return 0
+        lib = self.b["nvdec"]
+        lib.nvdec_bridge_seek_us.argtypes = [C.c_void_p, C.c_int64]
+        lib.nvdec_bridge_seek_us.restype = C.c_int32
+        return int(lib.nvdec_bridge_seek_us(self.decoder, int(relative_us)))
+
     def cancel_decoder(self):
-        if self.decoder:
+        if self.prores_input:
+            if self.prores_decoder:
+                self.prores_decoder.cancel()
+        elif self.decoder:
             self.b["nvdec"].nvdec_bridge_cancel(self.decoder)
 
     def close(self):
@@ -1447,7 +1502,7 @@ class HdrChain:
         errors = []
         release_owned(self, 'post_control', errors)
         release_owned(self, 'temporal_control', errors)
-        for name in ('truehdr_tail','export_resize', 'export_resize_bridge', 'framegen_tail', 'ordered_framegen', 'framegen_input', 'output_effect', 'native_output_exchange', 'input_effect',
+        for name in ('truehdr_tail','prores_output','export_resize', 'export_resize_bridge', 'framegen_tail', 'ordered_framegen', 'framegen_input', 'output_effect', 'native_output_exchange', 'input_effect',
                      'framegen', 'framegen_exchange', 'framegen_bridge',
                      'encode_exchange', 'encode_bridge', 'decode_bridge'):
             release_owned(self, name, errors)
@@ -1463,7 +1518,11 @@ class HdrChain:
                 errors.append(('decoder_context_pop', error))
             finally:
                 self.pushed = False
-        release_owned(self, 'decoder', errors, lambda handle: self.b['nvdec'].nvdec_bridge_close(handle))
+        if self.prores_input:
+            release_owned(self, 'prores_decoder', errors)
+            self.decoder = None
+        else:
+            release_owned(self, 'decoder', errors, lambda handle: self.b['nvdec'].nvdec_bridge_close(handle))
         finish_cleanup(errors)
 
     def _fail(self, symbol, code):
@@ -1479,6 +1538,8 @@ class HdrChain:
         source's rationals reach the SEI without passing through a float, and the
         snapshot a caller reads is the same struct's fields.
         """
+        if self.prores_input:
+            return self.prores_decoder.metadata()
         metadata = HdrMetadata(C.sizeof(HdrMetadata))
         code = int(self.b["nvdec"].nvdec_bridge_get_hdr_metadata(self.decoder,
                                                                  C.byref(metadata)))
@@ -1508,11 +1569,12 @@ class HdrChain:
         from the file name or from what the container's stream header said - the
         colour fields the bridge is handed are the ones the decoder reported.
         """
-        if int(frame.software_format) != NVDEC_SOFTWARE_FORMAT_P010:
+        expected_format = 3 if self.prores_input else NVDEC_SOFTWARE_FORMAT_P010
+        if int(frame.software_format) != expected_format:
             raise HdrExportError(
                 f"the decoder reported software_format {frame.software_format}, not "
-                f"{NVDEC_SOFTWARE_FORMAT_P010} (P010): this chain cannot read an "
-                "8-bit surface as 10-bit and will not encode one as if it were")
+                f"{expected_format} ({'P210' if self.prores_input else 'P010'}): this chain "
+                "refuses a surface with the wrong bit depth or chroma layout")
         if (int(frame.width), int(frame.height)) != self.src:
             raise HdrExportError(
                 f"the decoder yielded {frame.width}x{frame.height} where this export "
@@ -1547,15 +1609,18 @@ class HdrChain:
             working_width=self.working[0], working_height=self.working[1],
             paper_white_scrgb=float(self.policy["paper_white_scrgb"]))
         self.contract = self.bridge.contract
-        if self.processing_size != self.src or (self.preview_consumer is not None and self.input_effect is not None):
+        if self.prores_input or self.processing_size != self.src or (self.preview_consumer is not None and self.input_effect is not None):
             self.decode_bridge = self.bridge_type(d3d12_device=self.live.d3d12_device(),
                 cuda_context=context, full_width=self.src[0], full_height=self.src[1],
                 working_width=self.src[0], working_height=self.src[1],
-                paper_white_scrgb=float(self.policy['paper_white_scrgb']), purpose='decode')
+                paper_white_scrgb=float(self.policy['paper_white_scrgb']),
+                purpose='decode422' if self.prores_input else 'decode')
 
         # Preview owns display/readback. Preserve the decoder, context and colour
         # bridge setup, but do not open an output encoder for a preview-only chain.
         if self.preview_consumer is not None or getattr(self,'truehdr_tail',None):
+            return
+        if self.prores_output is not None:
             return
 
         options = HdrOptions()
@@ -1641,6 +1706,8 @@ class HdrChain:
                 support_ceiling_scrgb=float(self.policy["support_ceiling_scrgb"]),
                 **colour)
             source_report = decoder_bridge.source_report()
+            if self.prores_input and self.input_effect is None:
+                master = self.bridge.import_master(master.as_descriptor())
         else:
             from hdr_gpu_engine import DevicePlane
             master = DevicePlane(fmt='rgba16f_cuda', pixel_format='linear GPU VFG output',
@@ -1734,36 +1801,42 @@ class HdrChain:
         encoder_bridge = self.encode_bridge or self.bridge
         if self.preview_consumer is None and not (getattr(self, 'framegen_settings', None) and not getattr(self, 'ordered_framegen', None)):
             encoder_bridge = self._resize_output(composited, stages) or encoder_bridge
-        if getattr(self, 'truehdr_tail', None) and not (getattr(self, 'framegen_settings', None) and not getattr(self, 'ordered_framegen', None)):
+        framegen_active = bool(getattr(self, 'framegen_settings', None) and not getattr(self, 'ordered_framegen', None))
+        if self.preview_consumer is None and framegen_active:
+            mark = time.perf_counter()
+            if self.framegen is None:
+                from vfx_framegen import Interpolator
+                self.framegen = Interpolator(self.context, self.framegen_stage_size, self.framegen_settings,
+                    self.fps, wide=True, hdr=not self.sdr10 or getattr(self, 'framegen_hdr', False), cancel=getattr(self, 'cancel', None))
+            from native_effects import frame_at_size
+            self._framegen_frame = frame_at_size(frame, (frame.width, frame.height))
+            color = composited.as_descriptor()
+            if getattr(self, 'framegen_hdr', False): color['output_hdr'] = True
+            self.framegen.submit(color, frame, self._frame_reset, self._emit_generated)
+            stages['vfg_and_encoder_submit'] = (time.perf_counter()-mark)*1000
+            return None, None
+        if getattr(self, 'truehdr_tail', None):
             color = composited.as_descriptor()
             if getattr(self, 'output_effect', None) and self.output_effect.output_hdr:
                 color['output_hdr'] = True
             return self.truehdr_tail.encode(self, color, frame)
-        planes = None if getattr(self, 'truehdr_tail', None) else encoder_bridge.encode(
-            clip_ceiling_scrgb=float(self.policy["clip_ceiling_scrgb"]))
-        encode_report = None if planes is None else encoder_bridge.encode_report()
+        if self.prores_output is not None:
+            color = (getattr(self, '_resized_color', None)
+                     if encoder_bridge is getattr(self, 'export_resize_bridge', None)
+                     else composited.as_descriptor())
+            _, encode_report = self.prores_output.encode(color, frame, int(frame.pts))
+            stages['prores_submit'] = (time.perf_counter() - mark) * 1000.0
+            return None, encode_report
+        planes = encoder_bridge.encode(clip_ceiling_scrgb=float(self.policy["clip_ceiling_scrgb"]))
+        encode_report = encoder_bridge.encode_report()
         stages["hdr_encode"] = (time.perf_counter() - mark) * 1000.0
-
-        if self.preview_consumer is None:
-            mark = time.perf_counter()
-            if getattr(self, 'framegen_settings', None) and not getattr(self, 'ordered_framegen', None):
-                if self.framegen is None:
-                    from vfx_framegen import Interpolator
-                    self.framegen = Interpolator(self.context, self.framegen_stage_size, self.framegen_settings,
-                        self.fps, wide=True, hdr=not self.sdr10 or getattr(self, 'framegen_hdr', False), cancel=getattr(self, 'cancel', None))
-                from native_effects import frame_at_size
-                self._framegen_frame = frame_at_size(frame, (frame.width, frame.height))
-                color = composited.as_descriptor()
-                if getattr(self, 'framegen_hdr', False): color['output_hdr'] = True
-                self.framegen.submit(color, frame, self._frame_reset, self._emit_generated)
-                stages['vfg_and_nvenc_submit'] = (time.perf_counter()-mark)*1000
-                return planes, encode_report
-            code = int(self.b["nvenc"].nvenc_encode_p010(
-                self.encoder, planes.y.device_ptr, planes.y.pitch_bytes,
-                planes.uv.device_ptr, planes.uv.pitch_bytes, int(frame.pts)))
-            if code:
-                self._fail("nvenc_last_error", code)
-            stages["nvenc_submit"] = (time.perf_counter() - mark) * 1000.0
+        mark = time.perf_counter()
+        code = int(self.b["nvenc"].nvenc_encode_p010(
+            self.encoder, planes.y.device_ptr, planes.y.pitch_bytes,
+            planes.uv.device_ptr, planes.uv.pitch_bytes, int(frame.pts)))
+        if code:
+            self._fail("nvenc_last_error", code)
+        stages["nvenc_submit"] = (time.perf_counter() - mark) * 1000.0
         return planes, encode_report
 
     def _emit_generated(self, color, pts, kind):
@@ -1791,6 +1864,10 @@ class HdrChain:
         if getattr(self, 'truehdr_tail', None):
             self.truehdr_tail.encode(self, texture, self._framegen_frame, pts)
             return
+        if self.prores_output is not None:
+            resized = self._resize_output(color, {})
+            self.prores_output.encode(self._resized_color if resized is not None else color, self._framegen_frame, pts)
+            return
         self.framegen_bridge.import_master(color)
         self.framegen_bridge.set_composite(texture)
         encoder_bridge = self._resize_output(color, {}) or self.framegen_bridge
@@ -1817,6 +1894,7 @@ class HdrChain:
                 paper_white_scrgb=float(self.policy['paper_white_scrgb']))
         mark = time.perf_counter()
         resized = self.export_resize.color(color)
+        self._resized_color = resized.as_descriptor()
         self.export_resize_bridge.import_master(resized)
         self.export_resize_bridge.set_composite(self.export_resize.as_texture(resized))
         stages['export_resize'] = (time.perf_counter()-mark)*1000
@@ -1977,6 +2055,8 @@ class HdrChain:
         """
         out = {}
         if getattr(self,'truehdr_tail',None): out['truehdr'] = self.truehdr_tail.report()
+        if self.prores_output is not None: out['prores_encoder'] = self.prores_output.report()
+        if self.prores_decoder is not None: out['prores_decoder'] = self.prores_decoder.counters()
         if getattr(self, 'framegen', None) is not None:
             out['frame_generation'] = self.framegen.report()
             if hasattr(self, 'framegen_stage_index'):
@@ -1992,7 +2072,7 @@ class HdrChain:
             effect = getattr(self, name, None)
             if effect is not None:
                 out['native_' + name] = effect.report()
-        if self.decoder:
+        if self.decoder and not self.prores_input:
             block = gtx._NvdecCounters()
             block.struct_size = C.sizeof(gtx._NvdecCounters)
             if not self.b["nvdec"].nvdec_bridge_get_transfer_counters(
@@ -2052,6 +2132,7 @@ class HdrChain:
             if code:
                 self._fail("nvenc_last_error", code)
         if getattr(self,'truehdr_tail',None): self.truehdr_tail.finish()
+        if self.prores_output is not None: self.prores_output.finish()
 
 
 class HdrMultiScaleChain(HdrChain):
@@ -2901,8 +2982,9 @@ def _reserve_intermediate(negotiation):
     """
     if not negotiation["copy_pass"]:
         return None
-    handle, path = tempfile.mkstemp(suffix=gtx.INTERMEDIATE_CONTAINER,
-                                    prefix="dlss_gpu_hdr_")
+    suffix = (".mov" if negotiation.get("plan", {}).get("codec") == "prores_ks"
+              else gtx.INTERMEDIATE_CONTAINER)
+    handle, path = tempfile.mkstemp(suffix=suffix, prefix="dlss_gpu_hdr_")
     os.close(handle)
     os.unlink(path)
     return path
@@ -3054,8 +3136,10 @@ def _export_gpu_hdr_transfer(video, live, flow_provider, out_path, dims, frames,
     live_w, live_h = int(dims["live_w"]), int(dims["live_h"])
     uses_flow = bool(negotiation["uses_flow"])
     bridges = bridges or gtx.load_bridges(requires_flow=uses_flow)
+    cap_codec = (HDR_CODEC if str((transcode_settings or {}).get('codec', '')).lower() in
+                 ('prores_ks', 'prores') else (transcode_settings or {}).get('codec', HDR_CODEC))
     hdr_caps = hdr_caps or (load_sdr10_capabilities if sdr10 else load_hdr_capabilities)(
-        bridges, src_w, src_h, codec=(transcode_settings or {}).get('codec', HDR_CODEC))
+        bridges, src_w, src_h, codec=cap_codec)
     encoder_output = intermediate or out_path
     multi = negotiation.get("multi_scale")
     extra_layers = []
@@ -3119,6 +3203,7 @@ def _export_gpu_hdr_transfer(video, live, flow_provider, out_path, dims, frames,
     cleanup_error = None
     profiler.start()
     try:
+        native_phase('打开 HDR/10-bit 解码器', 300)
         chain.open_decoder()
         frame = gtx._DeviceFrame()
         frame.struct_size = C.sizeof(gtx._DeviceFrame)
@@ -3133,6 +3218,7 @@ def _export_gpu_hdr_transfer(video, live, flow_provider, out_path, dims, frames,
                     f"{gtx.WATCHDOG_TIMEOUT_SEC} 秒无有效帧），NVDEC / Feature18 / "
                     "NVENC 可能已死锁")
             t_decode = time.perf_counter()
+            native_phase(f'HDR/10-bit 解码第 {processed + 1} 帧', 300)
             state = selected_decoder.next(frame)
             decode_ms = (time.perf_counter() - t_decode) * 1000.0
             if state == 0:
@@ -3147,6 +3233,7 @@ def _export_gpu_hdr_transfer(video, live, flow_provider, out_path, dims, frames,
                 previous_timestamp and gtx._frame_timestamp_discontinuity(
                     previous_timestamp, frame, negotiation["fps"]))
             with gtx._session(lock):
+                native_phase(f'HDR/10-bit 处理第 {processed + 1} 帧', 300)
                 outcome = chain.process(frame, flow_provider, processed,
                                        is_discontinuous=discontinuous)
             previous_timestamp = (int(frame.pts), int(frame.time_base_num),
@@ -3161,8 +3248,8 @@ def _export_gpu_hdr_transfer(video, live, flow_provider, out_path, dims, frames,
                 "frame_idx": processed,
                 "decode": decode_ms,
                 "frame_total": frame_ms,
-                "decode_requested": "cuda",
-                "decode_actual": "cuda_nvdec_bridge_p010",
+                "decode_requested": "cpu" if chain.prores_input else "cuda",
+                "decode_actual": "libavcodec_prores_p210" if chain.prores_input else "cuda_nvdec_bridge_p010",
                 "export_backend_requested": str(js.get("export_backend", "auto")),
                 "export_backend_actual": "gpu_transfer",
                 "transfer_mode_requested": transfer_mode,
@@ -3208,15 +3295,14 @@ def _export_gpu_hdr_transfer(video, live, flow_provider, out_path, dims, frames,
                          f"[GPU 显存直传 {'SDR 10-bit' if sdr10 else 'HDR10'} 导出] {processed}/{frames} "
                          f"({processed / frames * 100:.1f}%) | "
                          f"{processed / elapsed:.1f} fps")
+        native_phase('排空 HDR/10-bit 编码器', 180)
         chain.finish()
     except BaseException as error:
         task_error = error
         raise
     finally:
-        # The cancel is only observed between frames, so this tells the decoder to
-        # stop draining whatever is left before any bridge goes away; a watchdog
-        # cannot cover a decode that never returns, because the loop and the decoder
-        # share this thread.
+        # A hung call is observed independently; no foreign thread closes it.
+        native_phase('关闭 HDR/10-bit 导出链路', 90)
         try:
             chain.cancel_decoder()
         except Exception as cancel_error:
@@ -3244,6 +3330,7 @@ def _export_gpu_hdr_transfer(video, live, flow_provider, out_path, dims, frames,
         if cleanup_error is not None:
             raise cleanup_error
 
+    native_phase('导出报告及容器封装', None)
     aggregate = aggregate_hdr_reports(chain.frame_reports)
     report = hdr_transfer_report(counters, processed, src_w, src_h,
                                  (live_w, live_h), negotiation["hdr_policy"],
@@ -3301,6 +3388,7 @@ def _export_gpu_hdr_transfer(video, live, flow_provider, out_path, dims, frames,
     report["hdr_copy_pass"] = bool(negotiation["copy_pass"])
     report["hdr_deliverable_written_by"] = (
         "ffmpeg_map_and_copy_pass" if negotiation["copy_pass"]
+        else "prores_software_encoder" if chain.prores_output_enabled
         else "nvenc_hdr_bridge")
     # The video stream's own descriptive fields this run asked the pass to put on the
     # deliverable: title and language as the source wrote them, and the flag list its
@@ -3310,8 +3398,21 @@ def _export_gpu_hdr_transfer(video, live, flow_provider, out_path, dims, frames,
         "hdr_video_stream_metadata")
     report["hdr_bridge_dll"] = (hdr_caps.get("colour_bridge") or {}).get("path")
     report["hdr_source_metadata"] = chain.source_metadata
-    report["hdr_mastering_wire_conversion"] = (None if counters.get('truehdr') else
+    report["hdr_mastering_wire_conversion"] = (None if counters.get('truehdr') or chain.prores_output_enabled else
         mastering_wire_report(chain.source_metadata, negotiation['plan']['codec']))
+    if chain.prores_output_enabled:
+        report['hdr_static_metadata'] = 'not authored by the ProRes software encoder'
+        report['hdr_software_encoder'] = counters.get('prores_encoder')
+        report['export_backend_actual'] = 'gpu_render_cpu_prores'
+        report['encoder_host_pixel_bytes_measured'] = counters['prores_encoder']['frame_host_readback_bytes']
+        report['encoder_frames_submitted_measured'] = counters['prores_encoder']['frames_submitted']
+        report['zero_copy'] = False
+        report['hdr_encoded_p010_bytes_logical'] = None
+        report['encoded_p210_bytes_logical'] = int(dims['dst_w']) * int(dims['dst_h']) * 4
+    if counters.get('prores_decoder'):
+        report['software_decoder'] = dict(codec='prores', pixel_format='yuv422p10le', **counters['prores_decoder'])
+        report['decode_p010_bytes_logical'] = None
+        report['decode_p210_bytes_logical'] = src_w * src_h * 4
     report["hdr_pixel_readback_exports_bound"] = (
         (hdr_caps.get("colour_bridge") or {}).get("pixel_readback_exports_bound"))
     report["decoder_pixel_readback_entry_bound"] = bool(
@@ -3351,6 +3452,9 @@ def _export_gpu_hdr_transfer(video, live, flow_provider, out_path, dims, frames,
                         "bitstream and the source's other streams crossed to the host "
                         "through FFmpeg's own buffers, which is mux traffic and not "
                         "picture traffic"}
+    if chain.prores_output_enabled or chain.prores_input:
+        report['hdr_not_claimed']['host_traffic'] = 'ProRes uses CPU codec frames and explicit GPU upload/readback; these are reported separately from scalar readback and compressed remux traffic.'
+        report['hdr_not_claimed']['mux'] = 'MOV ProRes output uses FFmpeg video packet copy when remuxing; audio/subtitle compatibility follows the selected MOV stream settings.'
     if diagnostics_out is not None:
         if sdr10:
             report = sdr10_report(report)

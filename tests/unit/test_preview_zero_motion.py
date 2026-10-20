@@ -35,6 +35,7 @@ class _PreviewSession:
 
 def _service(monkeypatch, *, guidance_mode=0, reconstruction_mode="single"):
     svc = dlss_service.DLSSService()
+    svc.resume_preview_memory()
     svc.video_path = "synthetic-source.mkv"
     svc.video_info = {"frames": 8, "fps": 30.0, "width": 8, "height": 4}
     svc.settings.update({"guidance_mode": guidance_mode,

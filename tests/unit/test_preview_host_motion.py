@@ -32,6 +32,7 @@ class _PreviewSession:
 @pytest.mark.parametrize("flow_engine", ["nvof", "fidelityfx", "dis", "raft"])
 def test_guided_preview_passes_flow_and_multiscale_configuration_to_session(flow_engine):
     service = dlss_service.DLSSService()
+    service.resume_preview_memory()
     service.video_path = "guided-source.mkv"
     service.video_info = {"frames": 12, "fps": 24, "width": 8, "height": 4}
     service.settings.update({"guidance_mode": 1, "flow_engine": flow_engine,
@@ -57,6 +58,7 @@ def test_guided_preview_passes_flow_and_multiscale_configuration_to_session(flow
 
 def test_preview_session_failure_is_reported_and_does_not_escape_render_preview():
     service = dlss_service.DLSSService()
+    service.resume_preview_memory()
     service.video_path = "guided-source.mkv"
     service.video_info = {"frames": 12, "fps": 24, "width": 8, "height": 4}
 
@@ -74,6 +76,7 @@ def test_preview_session_failure_is_reported_and_does_not_escape_render_preview(
 
 def test_busy_preview_lock_reports_waiting_without_calling_session():
     service = dlss_service.DLSSService()
+    service.resume_preview_memory()
     service.video_path = "guided-source.mkv"
     service.video_info = {"frames": 12, "fps": 24, "width": 8, "height": 4}
     session = _PreviewSession()

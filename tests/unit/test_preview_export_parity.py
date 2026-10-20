@@ -38,6 +38,7 @@ class _ExportCorePreview:
 
 def test_preview_forwards_export_multiscale_settings_and_reports_same_layers():
     service = dlss_service.DLSSService()
+    service.resume_preview_memory()
     service.video_path = "shared-export-source.mkv"
     service.video_info = {"frames": 10, "fps": 30, "width": 24, "height": 16}
     service.settings.update({"export_backend": "gpu_transfer",
@@ -69,6 +70,7 @@ def test_preview_forwards_export_multiscale_settings_and_reports_same_layers():
 
 def test_changing_settings_is_forwarded_to_session_and_not_a_cached_legacy_backend():
     service = dlss_service.DLSSService()
+    service.resume_preview_memory()
     service.video_path = "shared-export-source.mkv"
     service.video_info = {"frames": 10, "fps": 30, "width": 24, "height": 16}
     session = _ExportCorePreview()

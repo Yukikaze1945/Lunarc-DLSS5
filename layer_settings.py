@@ -1,7 +1,7 @@
 """Resolve independent NR parameters without overriding pipeline/colour settings."""
 import math
 
-NR_DEFAULTS = dict(style=0, intensity=1., local_tone=1., local_struct=1.,
+NR_DEFAULTS = dict(preset=1, style=0, intensity=1., local_tone=1., local_struct=1.,
                    skin_struct=1., use_auto_mask=1, ui_correction=0)
 
 
@@ -13,11 +13,13 @@ def resolve_layer_settings(settings, index):
     if index > 0 and index < len(layers):
         override = layers[index]
         if not isinstance(override, dict) or override.keys() - NR_DEFAULTS.keys():
-            raise ValueError('layer_settings only accepts NR style, strengths and mask options')
+            raise ValueError('layer_settings only accepts NR model, style, strengths and mask options')
         for key, value in override.items():
             if not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError(f'layer {index + 1}: {key} must be finite')
-            if key == 'style':
+            if key == 'preset':
+                valid = type(value) is int and value in (0, 1, 2, 3)
+            elif key == 'style':
                 valid = value in (0, 1, 2)
             elif key in ('use_auto_mask', 'ui_correction'):
                 valid = value in (0, 1)

@@ -51,19 +51,34 @@ def test_import_copies_verifies_deduplicates_and_activates(store, tmp_path):
     assert source.exists()
 
 
-@pytest.mark.parametrize('field,value,code', [
-    ('status', 'NotSigned', 'invalid_signature'), ('status', 'HashMismatch', 'invalid_signature'),
-    ('signer', 'CN=Other Corporation', 'wrong_publisher'),
-    ('signer', 'CN=NVIDIA Corporation Fake', 'wrong_publisher'),
-    ('product', 'NVIDIA DLSS', 'wrong_product'), ('version', 'unknown', 'unknown_version')])
-def test_refuses_untrusted_identity(store, tmp_path, field, value, code):
+@pytest.mark.parametrize('field,value', [
+    ('status', 'NotSigned'), ('status', 'HashMismatch'),
+    ('signer', 'CN=Other Corporation'),
+    ('signer', 'CN=NVIDIA Corporation Fake'),
+    ('product', 'NVIDIA DLSS'), ('version', 'unknown')])
+def test_unrecognized_identity_can_be_imported_and_selected(store, tmp_path, field, value):
     store.identity_checker = lambda path: {**identity(path), field: value}
-    with pytest.raises(runtime.RuntimeErrorDetail) as exc:
-        store.import_file(dll(tmp_path / runtime.NAME))
-    assert exc.value.code == code
+    record = store.import_file(dll(tmp_path / runtime.NAME), activate=True)
+    assert record['trust'] == 'unrecognized'
+    assert record['compatibility'] == 'uncharacterized'
+    assert record['signature'] == (value if field == 'status' else 'Valid')
+    assert store.load()['active'] == record['id']
+    assert Path(record['path']).is_file()
     assert not list(store.root.glob('incoming-*'))
     assert not store.operation_lock.locked()
-    assert not store.load()['versions']
+
+
+def test_unavailable_signature_is_informational_but_cache_tampering_still_fails(store, tmp_path):
+    def unavailable(path):
+        raise runtime.RuntimeErrorDetail('signature_unavailable', 'unavailable')
+    store.identity_checker = unavailable
+    record = store.import_file(dll(tmp_path / runtime.NAME), activate=True)
+    assert record['trust'] == 'unrecognized' and record['signature'] == 'Unavailable'
+    assert record['version'] == 'unknown'
+    Path(record['path']).write_bytes(b'tampered')
+    with pytest.raises(runtime.RuntimeErrorDetail) as exc:
+        store.verified_path(record['id'])
+    assert exc.value.code == 'cache_tampered'
 
 
 def test_hash_and_architecture_rejected_before_signature(tmp_path):
@@ -211,13 +226,10 @@ def test_host_receives_validated_path_and_layers_reuse_it(monkeypatch):
     first.close(); second.close()
 
 
-def test_uncharacterized_signed_version_needs_explicit_selection(store, tmp_path):
+def test_uncharacterized_signed_version_can_be_selected_after_identity_checks(store, tmp_path):
     record = store.import_file(dll(tmp_path / 'new.dll', b'B'))
     assert record['compatibility'] == 'uncharacterized'
-    with pytest.raises(runtime.RuntimeErrorDetail) as exc:
-        store.activate(record['id'])
-    assert exc.value.code == 'uncharacterized_version'
-    store.activate(record['id'], allow_unrecognized=True)
+    store.activate(record['id'])
     assert store.load()['active'] == record['id']
 
 

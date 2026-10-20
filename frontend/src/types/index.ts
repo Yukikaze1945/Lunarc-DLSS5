@@ -11,6 +11,7 @@ export interface VideoInfo {
   width: number
   height: number
   duration_seconds: number
+  codec_name?: string
   pix_fmt?: string
   bit_depth?: number
   is_hdr?: boolean
@@ -101,7 +102,7 @@ export interface DLSSSettings {
   truehdr_middle_gray?: number
   truehdr_peak_nits?: number
   truehdr_debanding?: boolean
-  layer_settings?: Partial<Pick<DLSSSettings, 'style' | 'intensity' | 'local_tone' |
+  layer_settings?: Partial<Pick<DLSSSettings, 'preset' | 'style' | 'intensity' | 'local_tone' |
     'local_struct' | 'skin_struct' | 'use_auto_mask' | 'ui_correction'>>[]
   fusion_mode: FusionMode
   fusion_beta: number

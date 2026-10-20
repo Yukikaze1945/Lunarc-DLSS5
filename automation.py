@@ -48,6 +48,7 @@ class Automation:
         if data.get('status') in TERMINAL or data.get('type') in ('queue_finished','job_removed','automation_blocked'):
             with self.condition:
                 if data.get('type')=='automation_blocked':self.blocked=data.get('error')
+                elif data.get('type')=='queue_finished':self.blocked=None
                 self.revision+=1
                 self.condition.notify_all()
 

@@ -25,6 +25,18 @@ def test_empty_non_object_settings_are_rejected(fixture,patch):
         fixture[1].settings(patch=patch)
 
 
+def test_transient_block_clears_after_queue_finished_but_native_fault_remains(fixture):
+    service, api, request = fixture
+    job_id = api.submit(request, None)['job']['id']
+    api.notify({'type': 'automation_blocked', 'error': 'transient'})
+    assert api.state([job_id])['blocked'] == 'transient'
+    api.notify({'type': 'queue_finished'})
+    assert api.state([job_id])['blocked'] is None
+    service._native_degraded = 'device removed'
+    api.notify({'type': 'queue_finished'})
+    assert api.state([job_id])['blocked'] == 'device removed'
+
+
 def test_draft_settings_leave_ui_revision_and_queued_snapshots_unchanged(fixture):
     service,api,request=fixture
     before=copy.deepcopy(service.settings)

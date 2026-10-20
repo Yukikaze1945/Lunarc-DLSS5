@@ -7,7 +7,7 @@ export const PREVIEW_LENGTHS = [
   {id:'s5',label:'5 秒',seconds:5},
 ] as const
 export type PreviewLength = typeof PREVIEW_LENGTHS[number]['id']
-export type PreviewMode = 'realtime'|'prerender'
+export type PreviewMode = 'realtime'|'prerender'|'single'
 export type PreviewRequest = {id:number;source:string;start_frame:number;end_frame:number}
 
 export function previewFrameRange(video:Pick<VideoInfo,'frames'|'fps'>,frame:number,length:PreviewLength){

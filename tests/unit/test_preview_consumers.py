@@ -184,6 +184,7 @@ def test_hdr_preview_skips_p010_conversion_and_nvenc():
 
     nvenc = _Nvenc()
     chain = htx.HdrChain.__new__(htx.HdrChain)
+    chain.prores_output = None
     chain.preview_consumer = lambda descriptor, frame: (descriptor, frame.pts)
     chain.bridge = Bridge()
     chain.encode_bridge = None
@@ -229,6 +230,7 @@ def test_hdr_without_preview_consumer_keeps_p010_nvenc_submission():
     nvenc = _Nvenc()
     chain = htx.HdrChain.__new__(htx.HdrChain)
     chain.preview_consumer = None
+    chain.prores_output = None
     chain.bridge = Bridge()
     chain.encode_bridge = None
     chain.policy = {"clip_ceiling_scrgb": 4.0}

@@ -3,7 +3,7 @@ import type { DLSSSettings, ReconstructionMode } from '../types'
 const percent = (scale: number) => Math.round(scale * 100)
 const toScale = (value: number) => value / 100
 
-export const layerNRKeys = ['style', 'intensity', 'local_tone', 'local_struct',
+export const layerNRKeys = ['preset', 'style', 'intensity', 'local_tone', 'local_struct',
   'skin_struct', 'use_auto_mask', 'ui_correction'] as const
 export type LayerNRKey = typeof layerNRKeys[number]
 

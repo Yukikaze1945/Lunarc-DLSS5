@@ -28,6 +28,7 @@ if hasattr(cv2, "setLogLevel"):
     cv2.setLogLevel(0)
 
 import pipeline
+from native_watchdog import NativeOperationTimeout, guarded as native_guard, phase as native_phase
 from dlss_errors import DLSSInferenceError
 from optical_flow import get_optical_flow_engine, get_frame_guidance_service
 
@@ -126,44 +127,6 @@ class DiagnosticLogger:
 diagnostic_logger = DiagnosticLogger(maxsize=1000)
 
 
-class NativeCallTimeout(RuntimeError):
-    """_run_with_timeout gave up on a native call that is still running.
-
-    A type, not a substring match on the text: the fuse that decides the native layer
-    may be polluted reads this fact alone, and an error that happens to contain the
-    word 超时 - or a hang whose label spells it differently - is not that fact.
-    """
-
-
-def _run_with_timeout(fn, timeout, what):
-    """Run fn() in a daemon thread with a timeout.
-
-    Native calls (dlss_gpu_host_open/close, torch weight download) can block
-    forever, uninterruptible from Python. A timeout turns the hang into a
-    clear error so the job fails (or the caller falls back) instead of
-    wedging the queue at 0 FPS with a dead cancel button. The stray thread is
-    left dangling by design; the error message tells the user to restart the
-    backend if the DLL state is broken. A timeout raises NativeCallTimeout,
-    which is what the native fuse reads.
-    """
-    box = {}
-
-    def _w():
-        try:
-            box["ret"] = fn()
-        except BaseException as e:  # noqa: BLE001 - must capture everything
-            box["err"] = e
-
-    t = threading.Thread(target=_w, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    if t.is_alive():
-        raise NativeCallTimeout(f"{what}超时（{timeout:.0f}s 无响应，可能已在原生层挂起；建议重启后端后重试）")
-    if "err" in box:
-        raise box["err"]
-    return box.get("ret")
-
-
 def _gpu_host_provenance(live):
     """Which native DLSS host a session is actually driving, for the job record.
 
@@ -198,6 +161,8 @@ class DLSSService:
     # Layout requests and render workers may arrive together during startup.
     # Protect construction separately from GPU work, so layout stays responsive.
     _preview_engine_creation_lock = threading.Lock()
+    _native_watchdog_creation_lock = threading.Lock()
+    _native_fault_latch_lock = threading.Lock()
     def __init__(self, *, queue_path=None):
         self.video_path = None
         self.video_info = None  # (total_frames, fps, width, height)
@@ -230,7 +195,7 @@ class DLSSService:
             "temporal_controls": __import__("temporal_control").TemporalControls().as_dict(),
             "flow_engine": "nvof",      # "nvof", "dis", "raft"
             "flow_quality": "1F",       # "1F", "1M", "1S", "2F" (or legacy 4M/4F)
-            "export_backend": "auto",   # "auto", "legacy", "gpu_transfer"
+            "export_backend": "gpu_transfer",   # "auto", "legacy", "gpu_transfer"
             "neural_mode": "nr",
             "vsr_quality": 2,
             "vsr_mode": "standard",
@@ -315,26 +280,41 @@ class DLSSService:
         # process for new DLSS work until the backend is restarted.
         self._native_degraded = None
         self._native_incident_id = None
+        self._native_checkpoint_ready = False
+
+    def _get_native_watchdog(self):
+        with self._native_watchdog_creation_lock:
+            if getattr(self, '_native_watchdog', None) is None:
+                from native_watchdog import NativeWatchdog
+                self._native_watchdog = NativeWatchdog(self._mark_native_degraded)
+            return self._native_watchdog
 
     def _mark_native_degraded(self, what):
-        if not self._native_degraded:
-            self._native_degraded = what
+        with self._native_fault_latch_lock:
+            if self._native_degraded:
+                return
+            self._native_checkpoint_ready = False
             self._native_incident_id = str(uuid.uuid4())
+            self._native_degraded = what
             self._preview_kick_cancelled = True
-            with self._queue_lock:
-                self._persist_queue()
-            if self._queue_store:
-                try:
-                    from gpu_memory import snapshot
-                    self._queue_store.save_fault({**self.backend_health(), 'last_memory_sample':snapshot()})
-                except Exception as error:
-                    diagnostic_logger.log('WARN','DLSS',f'故障记录保存失败：{error}')
-            diagnostic_logger.log("FATAL", "DLSS", f"原生层疑似污染，已熔断新任务：{what}。请重启后端后再试。")
+        with self._queue_lock:
+            self._native_checkpoint_ready = self._persist_queue() and self._queue_store is not None
+        if self._queue_store:
+            try:
+                from gpu_memory import snapshot
+                self._queue_store.save_fault({**self.backend_health(), 'last_memory_sample':snapshot()})
+            except Exception as error:
+                diagnostic_logger.log('WARN','DLSS',f'故障记录保存失败：{error}')
+        diagnostic_logger.log("FATAL", "DLSS", f"原生层疑似污染，已熔断新任务：{what}。请重启后端后再试。")
 
     def backend_health(self):
+        watchdog = getattr(self, '_native_watchdog', None)
         return dict(service='lunarc', pid=os.getpid(), healthy=not bool(self._native_degraded),
                     incident_id=self._native_incident_id, reason=self._native_degraded,
-                    queue_storage_error=self._queue_storage_error)
+                    queue_storage_error=self._queue_storage_error,
+                    recovery_checkpoint_ready=bool(self._queue_store) and not self._queue_storage_error and
+                        (not self._native_degraded or self._native_checkpoint_ready),
+                    native_operation=watchdog.snapshot() if watchdog else None)
 
     def enable_queue_storage(self, path):
         from queue_store import QueueStore
@@ -344,6 +324,19 @@ class DLSSService:
             self._queue_store = QueueStore(path)
             try:
                 restored = self._queue_store.load()
+                for job in restored:
+                    if job.get('status') != 'pending':
+                        continue
+                    options = dict(job['settings'])
+                    options.setdefault('export_backend', 'gpu_transfer')
+                    if options.get('export_backend') == 'legacy' and 'temporal_controls' not in options:
+                        # Legacy archives predate the GPU scene-detection default.
+                        options['temporal_controls'] = {'scene_detection': False, 'mode': 'off'}
+                    try:
+                        job['settings'] = self._resolve_automatic_backend(options)
+                    except (TypeError, ValueError):
+                        # A bad job setting must fail that job, not hide its queue.
+                        job['settings'] = options
                 self._queue_store.save(restored)
                 self.jobs = restored
             except Exception as error:
@@ -406,7 +399,19 @@ class DLSSService:
 
             # P1-01 honesty: expose source bit-depth/color so callers stop
             # pretending HDR survives the fixed 8-bit SDR neural path.
-            pix = pipeline.probe_pixel_info(path)
+            from image_source import is_image
+            image = is_image(path)
+            if image:
+                from hdr_image_decode import probe_hdr
+                hdr = probe_hdr(path)
+                pix = (dict(pix_fmt='rgba16f', bit_depth=int(hdr.get('bit_depth') or 16),
+                            is_hdr=True, color_transfer='linear', color_primaries='bt709',
+                            color_space='gbr', color_range='pc') if hdr else
+                       dict(pix_fmt='rgba', bit_depth=8, is_hdr=False,
+                            color_transfer='iec61966-2-1', color_primaries='bt709',
+                            color_space='gbr', color_range='pc'))
+            else:
+                pix = pipeline.probe_pixel_info(path)
             # A rejected drag/drop must not destroy the previously loaded source.
             self._preview_suspended = True
             if self._cap is not None:
@@ -419,7 +424,7 @@ class DLSSService:
                     f"输入为 {pix['pix_fmt'] or '未知格式'}/{pix['bit_depth']}-bit"
                     f"{' HDR' if pix['is_hdr'] else ' SDR'}；原生预览主色使用 FP16，显示图像为 8-bit；导出精度由导出链路决定。")
             self.video_info = {
-                "media_type": 'image' if __import__('image_source').is_image(path) else 'video',
+                "media_type": 'image' if image else 'video',
                 "has_alpha": bool(hasattr(cap,'rgba') and np.any(cap.rgba[:,:,3] != 255)),
                 "path": path,
                 "filename": os.path.basename(path),
@@ -429,6 +434,7 @@ class DLSSService:
                 "height": h,
                 "duration_seconds": round(total / fps, 2),
                 "pix_fmt": pix["pix_fmt"],
+                "codec_name": pix.get('codec_name', ''),
                 "bit_depth": pix["bit_depth"],
                 "is_hdr": pix["is_hdr"],
                 "color_transfer": pix["color_transfer"],
@@ -631,7 +637,7 @@ class DLSSService:
             _hdr_reasons = _hdr_request(merged)[1]
             if _hdr_reasons:
                 raise ValueError("; ".join(_hdr_reasons))
-        for key, valid, default in (('preset', (1, 2, 3), 1), ('style', (0, 1, 2, 3), 0)):
+        for key, valid, default in (('preset', (0, 1, 2, 3), 1), ('style', (0, 1, 2, 3), 0)):
             if key in new_settings:
                 try:
                     value = int(new_settings[key])
@@ -653,6 +659,15 @@ class DLSSService:
                     resolve_layer_settings(merged, index)
                 new_settings['layer_settings'] = copy.deepcopy(new_settings['layer_settings'])
             current = dict(current, **new_settings)
+        return self._resolve_automatic_backend(current)
+
+    @staticmethod
+    def _resolve_automatic_backend(current):
+        if current.get('export_backend') == 'auto':
+            from post_control import controls_from_settings
+            from temporal_control import temporal_from_settings
+            if not controls_from_settings(current).neutral or temporal_from_settings(current).enabled:
+                current['export_backend'] = 'gpu_transfer'
         return current
 
     def _preview_live_kind(self):
@@ -735,6 +750,7 @@ class DLSSService:
         live._gpu_options_key = self._gpu_preview_options_key()
         return live
 
+    @native_guard('预览会话初始化', 300)
     def _get_or_create_live(self, w, h):
         """Ensure a live session exists for the current preview kind and dims."""
         if self.active_job_id is not None or getattr(self,'_live_session_owner',None)=='export':
@@ -769,16 +785,13 @@ class DLSSService:
 
         if session:
             try:
-                _run_with_timeout(session.close, 15, "DLSS 预览会话关闭")
+                native_phase('关闭旧预览会话', 90)
+                session.close()
             except Exception as ce:
-                # The same rule the queue applies to its own session: an exception from
-                # close is survivable, a close that never came back means a native call
-                # is still running on a thread this process no longer owns. Opening the
-                # next session on top of it is exactly the pollution spread the fuse
-                # exists to stop, so the fuse is set here too and the frame fails.
+                # The observer may have latched a timeout as this owner returned.
                 diagnostic_logger.log("WARN", "Preview",
                                       f"预览旧会话关闭异常/超时，继续重建: {ce}")
-                if isinstance(ce, NativeCallTimeout):
+                if isinstance(ce, NativeOperationTimeout):
                     self._mark_native_degraded(f"预览旧会话关闭超时 ({ce})")
                     raise
             self._live_session = None
@@ -787,9 +800,8 @@ class DLSSService:
 
         try:
             module = self._import_gpu_host()
-            live = _run_with_timeout(
-                lambda: self._open_gpu_live(module, w, h, kind),
-                120, f"GPU {kind} 预览会话初始化")
+            native_phase(f'GPU {kind} 预览会话初始化', 300)
+            live = self._open_gpu_live(module, w, h, kind)
             self._live_session = live
             self._live_session_owner = 'preview'
             self._live_session_dims = dims
@@ -887,6 +899,11 @@ class DLSSService:
     def preview_diagnostics(self):
         return dict(getattr(self, '_preview_diagnostics', {}) or {})
 
+    @native_guard('更新原生预览显示', 90)
+    def configure_native_preview(self, layout):
+        self._ensure_native_healthy()
+        return self._get_gpu_preview().configure_native(layout)
+
     def preview_memory_state(self):
         return dict(suspended=getattr(self,'_preview_suspended',False),
             releasing=getattr(self,'_preview_release_busy',False),
@@ -899,8 +916,11 @@ class DLSSService:
         if getattr(self,'_preview_release_busy',False):raise ValueError('正在释放预览显存，请稍候')
         self._preview_suspended=True;self._preview_release_busy=True;self._preview_release_error=None
 
+    @native_guard('释放预览资源', 90)
     def release_preview_memory(self):
-        if not self._live_lock.acquire(timeout=30):raise ValueError('当前 GPU 操作尚未结束，预览保持暂停，请稍后重试释放')
+        if not self._live_lock.acquire(timeout=30):
+            self._preview_release_busy = False
+            raise ValueError('当前 GPU 操作尚未结束，预览保持暂停，请稍后重试释放')
         try:
             self._ensure_native_healthy()
             if self.active_job_id is not None or getattr(self,'_live_session_owner',None)=='export':
@@ -918,10 +938,13 @@ class DLSSService:
             return report
         except Exception as error:
             from gpu_faults import recovery_reason
+            self._preview_release_error = str(error)
             reason=recovery_reason(error)
             if reason:self._mark_native_degraded(reason)
             raise
-        finally:self._live_lock.release()
+        finally:
+            self._preview_release_busy = False
+            self._live_lock.release()
 
     def resume_preview_memory(self):
         self._ensure_native_healthy()
@@ -929,13 +952,13 @@ class DLSSService:
         self._preview_suspended=False;self._preview_release_error=None
         return self.preview_memory_state()
 
-    def image_result_state(self, path):
+    def image_result_state(self, path, frame_index=None):
         engine=getattr(self,'_gpu_preview',None)
         if engine is None:
             return dict(available=False,results=[])
         with self._settings_lock:
             settings=dict(self.settings)
-        return engine.image_results.status(path,settings)
+        return engine.image_results.status(path,settings,frame_index)
 
     def image_result_preview(self, result_id, reference_id=None):
         from image_render import preview_pair
@@ -946,10 +969,16 @@ class DLSSService:
         reference=engine.image_results.get(reference_id) if reference_id else None
         return preview_pair(result,reference)
 
-    def render_image(self, path, memory_mode='memory', native=False):
+    @native_guard('图片或单帧渲染', 600)
+    def render_image(self, path, memory_mode='memory', native=False, frame_index=None):
         from image_source import is_image
-        if not is_image(path) or path != self.video_path:
-            raise ValueError('请选择当前载入的图片素材')
+        if path != self.video_path:
+            raise ValueError('请选择当前载入的素材')
+        if is_image(path) and frame_index is not None:
+            raise ValueError('图片不需要指定视频帧号')
+        if not is_image(path):
+            if type(frame_index) is not int or not 0 <= frame_index < int(self.video_info['frames']):
+                raise ValueError('请选择视频范围内的单帧')
         if not self._live_lock.acquire(timeout=2):
             raise ValueError('GPU 正忙，请稍后渲染图片')
         try:
@@ -968,14 +997,15 @@ class DLSSService:
                 revision=getattr(self,'_preview_revision',0)
             source_revision=getattr(self,'_preview_source_revision',0)
             engine=self._get_gpu_preview()
-            info=engine.render_image(path,settings,memory_mode)
+            info=(engine.render_image(path,settings,memory_mode) if is_image(path) else
+                  engine.render_video_frame(path,settings,frame_index))
             if path != self.video_path or source_revision != getattr(self,'_preview_source_revision',0):
                 return dict(discarded=True)
             if native and not getattr(self,'_preview_suspended',False) and self.active_job_id is None:
                 info['diagnostics']['native_display']=engine.present_image_result(info['id'])
             info['diagnostics']['settings_revision']=revision
             self._preview_diagnostics=info['diagnostics']
-            state=engine.image_results.status(path,self.settings)
+            state=engine.image_results.status(path,self.settings,frame_index)
             return dict(result=info,current=state.get('current',False),previous=state.get('previous'))
         except Exception as error:
             from gpu_faults import recovery_reason
@@ -985,6 +1015,7 @@ class DLSSService:
         finally:
             self._live_lock.release()
 
+    @native_guard('显示图片对比', 90)
     def compare_image_results(self, result_id, reference_id=None):
         if not self._live_lock.acquire(timeout=2):
             raise ValueError('GPU 正忙，请稍后切换图片对比')
@@ -1008,29 +1039,40 @@ class DLSSService:
         finally:
             self._live_lock.release()
 
+    @native_guard('图片导出渲染', 600)
     def export_image(self, path, output_path, fmt='png', quality=95, preserve_alpha=True, overwrite=False, color_mode='sdr',
-                     render_source='rerender', result_id=None, allow_stale=False, settings_override=None):
+                     render_source='rerender', result_id=None, allow_stale=False, settings_override=None, frame_index=None):
         from image_source import is_image, validate_destination
-        if not is_image(path):
-            raise ValueError('请选择图片素材')
+        video_frame=not is_image(path)
+        if video_frame and (type(frame_index) is not int or frame_index < 0):
+            raise ValueError('视频图片导出需要指定单帧')
         validate_destination(path, output_path, fmt, quality, overwrite, color_mode)
         if render_source == 'preview':
             from image_render import source_key,signature,save_result
             engine=getattr(self,'_gpu_preview',None)
             if engine is None:raise ValueError('尚未渲染图片，请先渲染一帧')
-            state=self.image_result_state(path)
+            state=self.image_result_state(path,frame_index)
             result=engine.image_results.get(result_id or (state.get('result') or {}).get('id'))
             if result.source != source_key(path):
                 raise ValueError('原图片已改变，这份缓存不能用于当前素材')
+            if result.frame_index != frame_index:
+                raise ValueError('缓存帧与选定帧不一致，请重新渲染当前帧')
             with self._settings_lock:
-                current=result.settings_key==signature(self.settings)
+                current=result.settings_key==signature(self.settings,video_frame)
             if not current and not allow_stale:
                 raise ValueError('参数已改变；请重新渲染，或明确选择导出上次结果')
             # Format conversion needs neither a healthy GPU nor its ownership lock.
+            native_phase('图片格式编码', None)
             saved=save_result(result,output_path,fmt,quality,preserve_alpha,overwrite,color_mode)
             return dict(saved,reused_render=True,settings_current=current)
         if render_source != 'rerender':
             raise ValueError('图片导出来源无效')
+        if video_frame:
+            # Render once through the same preview pipeline, then convert its host cache.
+            rendered=self.render_image(path,native=False,frame_index=frame_index)
+            if rendered.get('discarded'):raise ValueError('素材已更换，请重新导出')
+            return self.export_image(path,output_path,fmt,quality,preserve_alpha,overwrite,color_mode,
+                'preview',rendered['result']['id'],True,frame_index=frame_index)
         if not self._live_lock.acquire(timeout=2):
             raise ValueError('GPU 正忙，请稍后导出图片')
         try:
@@ -1051,6 +1093,7 @@ class DLSSService:
             engine=self._get_gpu_preview()
             result=engine.export_image(path, settings, output_path,fmt,quality,preserve_alpha,overwrite,color_mode)
             if getattr(self,'_preview_suspended',False):
+                native_phase('释放图片渲染资源', 90)
                 try:engine.release_memory()
                 except Exception as error:raise RuntimeError(f'图片已保存到 {result["path"]}，但预览显存释放失败：{error}') from error
             return result
@@ -1063,6 +1106,7 @@ class DLSSService:
         finally:
             self._live_lock.release()
 
+    @native_guard('GPU 预览', 300)
     def _render_gpu_preview(self, frame_idx, view, split_x, zoom, pan, preview_mode, display_edge=0, native=False):
         if not self._live_lock.acquire(timeout=2):
             return None, 'GPU is busy; preview waiting, no layer reduction'
@@ -1147,6 +1191,7 @@ class DLSSService:
         self._preview_diagnostics = diagnostics
         return (encoded.tobytes(), 'ok') if ok else (None, 'Preview encoding failed')
 
+    @native_guard('预览渲染', 300)
     def render_preview(self, frame_idx: int, view: str = "dlss", split_x: float = 0.5,
                        zoom: float = 1.0, pan: tuple = (0.5, 0.5), preview_mode: bool = False, display_edge: int = 0, native=False):
         """Render preview frame according to active view and settings."""
@@ -1360,7 +1405,7 @@ class DLSSService:
 
     # ---------------- Queue & Batch Export ----------------
     def add_job(self, job_data: dict):
-        job_settings = dict(job_data.get("settings") or self.settings)
+        job_settings = self.normalize_settings(job_data.get("settings") or {})
         # A queued job must keep its own layer vector even if the settings UI
         # changes the saved arrays before the worker starts.
         for key in ("layer_scales", "layer_weights"):
@@ -1545,6 +1590,9 @@ class DLSSService:
         self._preview_kick_cancelled = True
         self._automation_kick_cancelled = True
         self._cancel_requested = True
+        watchdog = getattr(self, '_native_watchdog', None)
+        if watchdog is not None:
+            watchdog.cancel()
         self._kill_active_procs()
         diagnostic_logger.log("WARN", "Queue", "收到主动取消当前渲染作业请求（已置位并杀死编码子进程）")
 
@@ -1792,6 +1840,7 @@ class DLSSService:
         live_type = self._import_gpu_host().Live
         return live_type(width, height, settings, **({'color_format': 'rgba16f'} if wide else {}))
 
+    @native_guard('初始化导出链路', 300, kind='export')
     def _execute_job(self, job, progress_callback):
         try:
             return self._execute_job_owned(job,progress_callback)
@@ -1802,6 +1851,7 @@ class DLSSService:
                 self._mark_native_degraded(reason)
             raise
         finally:
+            native_phase('释放导出资源', 90)
             from gpu_memory import inactive
             inactive('export')
             # Guidance/encoder setup can fail before the frame-loop finally.
@@ -1857,9 +1907,11 @@ class DLSSService:
                      and not high_precision.hdr_requested(job.get("settings"))
                      and high_precision.sdr10_source(source_precision))
         codec_check = str(ts_job_early.get("codec", job.get("codec", "av1_nvenc")))
-        allowed_codecs = {"av1_nvenc", "hevc_nvenc", "h264_nvenc", "libx264", "libx265", "mpeg4"}
+        allowed_codecs = {"av1_nvenc", "hevc_nvenc", "h264_nvenc", "libx264", "libx265", "mpeg4", "prores_ks"}
         if codec_check not in allowed_codecs:
             raise RuntimeError(f"FFmpeg Unknown encoder / 不可用编码器参数: {codec_check}")
+        if codec_check == 'prores_ks' and (job.get('settings') or self.settings).get('export_backend') != 'gpu_transfer':
+            raise RuntimeError('ProRes 422 HQ 需要选择 GPU Transfer 渲染后端')
 
         # P1-01 honesty: the neural pipe is 8-bit SDR, so HDR/10-bit+ output
         # requests can only re-tag 8-bit data. Warn loudly instead of silently
@@ -1988,10 +2040,11 @@ class DLSSService:
             self._close_gpu_preview()
             if self._live_session:
                 try:
-                    _run_with_timeout(self._live_session.close, 15, "DLSS 会话关闭")
+                    native_phase('关闭旧导出会话', 90)
+                    self._live_session.close()
                 except Exception as ce:
                     diagnostic_logger.log("WARN", "Queue", f"旧会话关闭异常/超时，继续重建: {ce}")
-                    if isinstance(ce, NativeCallTimeout):
+                    if isinstance(ce, NativeOperationTimeout):
                         self._mark_native_degraded(f"旧会话关闭超时 ({ce})")
                         raise
                 self._live_session = None
@@ -2000,12 +2053,11 @@ class DLSSService:
                 # SDR10/HDR and ordered DLAA/VSR pipelines must request the same
                 # wide session as preview. The NR factory uses color_format;
                 # native_effects.make_live uses wide, not that NR keyword.
-                live = _run_with_timeout(
-                    lambda: self._create_export_live(live_w, live_h, job_settings,
-                                                    wide=experimental_hdr or sdr10_job),
-                    120, "DLSS Live 会话初始化 (4K 首建需编译着色器，请耐心)")
+                native_phase('初始化 DLSS 导出会话', 300)
+                live = self._create_export_live(live_w, live_h, job_settings,
+                                                wide=experimental_hdr or sdr10_job)
             except Exception as e:
-                if isinstance(e, NativeCallTimeout):
+                if isinstance(e, NativeOperationTimeout):
                     self._mark_native_degraded(f"会话初始化超时 ({e})")
                 raise RuntimeError(f"GPU DLSS 会话初始化失败：{e}") from e
             self._live_session = live
@@ -2073,10 +2125,9 @@ class DLSSService:
         guidance_service = None
         if need_flow and job_settings.get('flow_engine') != 'fidelityfx' and not (requested_export_backend == 'gpu_transfer' and job_settings.get('flow_engine') in ('raft', 'raft_large')):
             try:
-                guidance_service = _run_with_timeout(
-                    lambda: get_frame_guidance_service(job_settings.get("flow_engine", "nvof"), job_settings.get("flow_quality", "1F"),
-                        **_raft_flow_options(job_settings)),
-                    90, "光流引擎与 Guidance 初始化")
+                native_phase('初始化光流引导', 300)
+                guidance_service = get_frame_guidance_service(job_settings.get("flow_engine", "nvof"),
+                    job_settings.get("flow_quality", "1F"), **_raft_flow_options(job_settings))
             except Exception as e:
                 raise RuntimeError(f"光流引擎初始化失败：{e}（可尝试将光流引擎切换为 dis（CPU DIS）后重试）")
 
@@ -2095,6 +2146,7 @@ class DLSSService:
 
         def _progress(cur, total, msg):
             nonlocal frames_done, t0
+            native_phase(f'导出第 {cur + 1} 帧', 300)
             frames_done = cur
             elapsed = max(0.001, time.time() - t0)
             cur_fps = frames_done / elapsed
@@ -2133,6 +2185,7 @@ class DLSSService:
                 if os.path.getsize(out_path) == 0:
                     raise RuntimeError(f"导出失败：生成的目标文件大小为 0 字节: {out_path}")
         finally:
+            native_phase('关闭导出会话', 90)
             # Written from the finally, not after the call: an opt-in backend that
             # refused is only diagnosable if the failed job still carries the
             # reasons it gave for refusing.

@@ -34,8 +34,17 @@ def source_key(path):
     return os.path.normcase(os.path.realpath(path)), stat.st_mtime_ns, stat.st_size
 
 
-def signature(settings):
-    value = image_settings(settings)
+def video_frame_settings(settings):
+    import native_effects
+    value = native_effects.execution_settings(settings)
+    value.update(frame_generation='off',export_backend='gpu_transfer')
+    value['render_pipeline'] = [stage for stage in native_effects.stages(value) if stage != 'vfg']
+    if not value['render_pipeline']:value['_pipeline_bypass']=True
+    return value
+
+
+def signature(settings, video_frame=False):
+    value = video_frame_settings(settings) if video_frame else image_settings(settings)
     for key in ('image_memory_mode', 'image_preview_realtime', 'output_dir', 'output_path',
                 'crf', 'overwrite', 'transcode_settings', 'frame_multiplier', 'framegen_quality',
                 'framegen_target_fps', 'framegen_scene_detection', 'frame_generation_saved_mode'):
@@ -58,6 +67,7 @@ class ImageResult:
     hdr: bool
     diagnostics: dict
     created: float
+    frame_index: int | None = None
 
     def info(self, diagnostics=True):
         result = dict(id=self.id, path=self.source[0], filename=os.path.basename(self.source[0]),
@@ -65,6 +75,7 @@ class ImageResult:
             processing_format='rgba16f/scRGB' if self.hdr else 'rgba8/sRGB',
             host_bytes=self.original.nbytes+self.pixels.nbytes, created_at=self.created)
         if diagnostics:result['diagnostics']=self.diagnostics
+        if self.frame_index is not None:result['frame_index']=self.frame_index
         return result
 
 
@@ -96,11 +107,12 @@ class ImageResults:
                 return None
             return self.entries[keys[keys.index(result_id)-1]]
 
-    def status(self, path, settings):
+    def status(self, path, settings, frame_index=None):
         normalized = os.path.normcase(os.path.realpath(path))
         with self.lock:
             entries = list(reversed(self.entries.values()))
-            result = next((r for r in entries if r.source[0] == normalized), None)
+            result = next((r for r in entries if r.source[0] == normalized and
+                           (frame_index is None or r.frame_index == frame_index)), None)
             if result is None:
                 return dict(available=False, results=[r.info(False) for r in entries])
             try:
@@ -108,7 +120,7 @@ class ImageResults:
             except OSError:
                 same_source = False
             previous = self.previous(result.id)
-            return dict(available=True, current=same_source and result.settings_key == signature(settings),
+            return dict(available=True, current=same_source and result.settings_key == signature(settings,result.frame_index is not None),
                 source_unchanged=same_source, result=result.info(False),
                 previous=previous.info(False) if previous else None, results=[r.info(False) for r in entries])
 
@@ -351,6 +363,8 @@ def render_passes(original, settings, nr_runner, stage_runner=effect_pass):
     for stage in stages(settings):
         if stage_kind(stage) == 'vfg':
             continue
+        from native_watchdog import phase
+        phase(f'图片处理：{stage}', 600)
         transfer_bytes += pixels.nbytes
         pixels, hdr, report = (nr_runner(pixels,settings) if stage == 'nr' and not hdr
                                 else stage_runner(pixels,hdr,settings,stage))
@@ -361,6 +375,18 @@ def render_passes(original, settings, nr_runner, stage_runner=effect_pass):
         transfer_bytes += pixels.nbytes
         reports.append(report)
     return np.ascontiguousarray(output_pixels(pixels,source,settings)), hdr, reports, transfer_bytes
+
+
+def sdr_pixels(pixels):
+    """Linear SDR FP16 to the image export's sRGB RGBA8 contract."""
+    if pixels.dtype == np.uint8:return pixels
+    if not np.isfinite(pixels).all():raise ValueError('单帧结果包含非有限值')
+    linear = np.clip(pixels[:,:,:3].astype(np.float32),0,1)
+    encoded = np.where(linear<=.0031308,12.92*linear,1.055*np.power(linear,1/2.4)-.055)
+    rgba = np.empty(pixels.shape,np.uint8)
+    rgba[:,:,:3] = np.rint(encoded*255).astype(np.uint8)
+    rgba[:,:,3] = np.rint(np.clip(pixels[:,:,3],0,1)*255).astype(np.uint8)
+    return rgba
 
 
 def make_result(path, initial_key, settings, original, pixels, hdr, diagnostics):

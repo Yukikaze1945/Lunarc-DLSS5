@@ -35,7 +35,7 @@ import uvicorn
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Query, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from dlss_service import dlss_service, diagnostic_logger
 from queue_payload import diagnostic_json, queue_job, queue_message
@@ -417,6 +417,7 @@ class RuntimeImportRequest(BaseModel):
     sha256: str = ''
     catalog_id: Optional[str] = None
     confirmed: bool = False
+    activate: bool = True
 
 
 class RuntimeSelectionRequest(BaseModel):
@@ -457,8 +458,12 @@ def remove_dlssnr_source(source_id: str):
 @app.post('/api/runtime/dlssnr/import')
 def import_dlssnr(body: RuntimeImportRequest):
     from dlssnr_runtime import manager
-    return _runtime_call(lambda: manager().import_file(body.path, body.sha256, body.source_id,
+    value = manager()
+    record = _runtime_call(lambda: value.import_file(body.path, body.sha256, body.source_id,
                         catalog_id=body.catalog_id, confirmed=body.confirmed))
+    if body.activate:
+        _runtime_session_change(lambda: value.activate(record['id']))
+    return record
 
 
 def _runtime_session_change(fn):
@@ -520,9 +525,9 @@ def dialog_open_file():
         path = filedialog.askopenfilename(
             title="选择导入素材 (视频 / 图像)",
             filetypes=[
-                ("所有支持的媒体", "*.mp4;*.mkv;*.mov;*.avi;*.wmv;*.flv;*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.tif;*.tiff;*.avif;*.heic;*.heif;*.jxl"),
-                ("视频文件", "*.mp4;*.mkv;*.mov;*.avi;*.wmv;*.flv"),
-                ("图像文件", "*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.tif;*.tiff;*.avif;*.heic;*.heif;*.jxl"),
+                ("所有支持的媒体", "*.mp4;*.mkv;*.mov;*.avi;*.wmv;*.flv;*.webm;*.m4v;*.mpg;*.mpeg;*.ts;*.mts;*.m2ts;*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.tif;*.tiff;*.avif;*.heic;*.heif;*.jxl;*.jxr;*.wdp;*.hdp"),
+                ("视频文件", "*.mp4;*.mkv;*.mov;*.avi;*.wmv;*.flv;*.webm;*.m4v;*.mpg;*.mpeg;*.ts;*.mts;*.m2ts"),
+                ("图像文件", "*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.tif;*.tiff;*.avif;*.heic;*.heif;*.jxl;*.jxr;*.wdp;*.hdp"),
                 ("所有文件", "*.*")
             ]
         )
@@ -580,6 +585,7 @@ class ImageExportRequest(BaseModel):
     render_source: str = 'rerender'
     result_id: Optional[str] = None
     allow_stale: bool = False
+    frame_index: Optional[int] = Field(default=None,ge=0)
 
 
 @app.post('/api/image/export')
@@ -587,7 +593,7 @@ def export_image(req: ImageExportRequest):
     try:
         result = dlss_service.export_image(req.path, req.output_path, req.format,
             req.quality, req.preserve_alpha, req.overwrite, req.color_mode,
-            req.render_source,req.result_id,req.allow_stale)
+            req.render_source,req.result_id,req.allow_stale,frame_index=req.frame_index)
         return {'status': 'ok', 'image': result}
     except Exception as error:
         raise HTTPException(status_code=400, detail=str(error))
@@ -597,19 +603,20 @@ class ImageRenderRequest(BaseModel):
     path: str
     memory_mode: str = 'memory'
     native: bool = False
+    frame_index: Optional[int] = Field(default=None,ge=0)
 
 
 @app.post('/api/image/render')
 def render_image(req: ImageRenderRequest):
     try:
-        return diagnostic_json(dlss_service.render_image(req.path,req.memory_mode,req.native))
+        return diagnostic_json(dlss_service.render_image(req.path,req.memory_mode,req.native,req.frame_index))
     except Exception as error:
         raise HTTPException(400,str(error)) from error
 
 
 @app.get('/api/image/results')
-def image_results(path: str):
-    try:return diagnostic_json(dlss_service.image_result_state(path))
+def image_results(path: str, frame_index: Optional[int] = Query(None,ge=0)):
+    try:return diagnostic_json(dlss_service.image_result_state(path,frame_index))
     except (ValueError,OSError) as error:raise HTTPException(400,str(error)) from error
 
 
@@ -912,8 +919,7 @@ def get_job_diagnostic(job_id: str, summary: bool = False):
 async def configure_native_preview(request: Request):
     data = await request.json()
     try:
-        engine = await asyncio.to_thread(dlss_service._get_gpu_preview)
-        return await asyncio.to_thread(engine.configure_native,data)
+        return await asyncio.to_thread(dlss_service.configure_native_preview,data)
     except (ValueError,RuntimeError) as error:
         from gpu_faults import recovery_reason
         reason=recovery_reason(error)

@@ -1,6 +1,6 @@
 import {test} from 'node:test'
 import assert from 'node:assert/strict'
-import {BackendRecovery,mayRestartBackend} from '../../frontend/electron/backendRecovery.ts'
+import {BackendRecovery,BackendLiveness,mayRestartBackend} from '../../frontend/electron/backendRecovery.ts'
 
 test('one incident restarts once, preserving the single child boundary',async()=>{
   let starts=0,unblock:()=>void=()=>{}
@@ -30,4 +30,31 @@ test('unowned process, healthy backend and failed checkpoint cannot be restarted
   assert(!mayRestartBackend(health,456));assert(!mayRestartBackend(health,null))
   assert(!mayRestartBackend({...health,healthy:true},123))
   assert(!mayRestartBackend({...health,queue_storage_error:'disk full'},123))
+  assert(!mayRestartBackend({...health,recovery_checkpoint_ready:false},123))
+})
+
+test('unresponsive native owner recovers only after its observed deadline and grace',()=>{
+  let now=0
+  const liveness=new BackendLiveness(()=>now)
+  const health={service:'lunarc',pid:123,healthy:true,incident_id:null,reason:null,
+    recovery_checkpoint_ready:true,native_operation:{id:'one',phase:'GPU frame',remaining_ms:30000,timed_out:false}}
+  assert.equal(liveness.unresponsive(123),null)
+  liveness.observe(health,123)
+  now=44999;assert.equal(liveness.unresponsive(123),null)
+  now=45000;assert.equal(liveness.unresponsive(123)?.incident,'hang:123:one')
+  assert.equal(liveness.unresponsive(456),null)
+  liveness.observe({...health,native_operation:null},123)
+  assert.equal(liveness.unresponsive(123),null)
+})
+
+test('healthy idle, external backend and failed queue checkpoint never imply a native hang',()=>{
+  let now=0
+  const liveness=new BackendLiveness(()=>now)
+  const health={service:'lunarc',pid:123,healthy:true,incident_id:null,reason:null,
+    recovery_checkpoint_ready:true,native_operation:{id:'one',phase:'GPU',remaining_ms:0,timed_out:false}}
+  for(const invalid of [{...health,pid:456},{...health,recovery_checkpoint_ready:false},
+    {...health,queue_storage_error:'disk full'},{...health,native_operation:null}]){
+    liveness.observe(invalid,123);now+=100000
+    assert.equal(liveness.unresponsive(123),null)
+  }
 })

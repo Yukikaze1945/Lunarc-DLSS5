@@ -114,6 +114,15 @@ test('HDR permits final export resizing after VSR', () => {
   assert.ok(hdrBlockers({...input,outputWidth:2561,outputHeight:1440}).some(s=>s.includes('输出分辨率')))
 })
 
+test('HDR ProRes output bypasses NVENC shape checks but retains source-domain checks',()=>{
+  const input=form({...ON},{codec:'prores_ks',container:'.mov',profile:'hq',pixel_format:'yuv422p10le'},
+    {video:{...HDR_VIDEO,codec_name:'prores',pix_fmt:'yuv422p10le'},outPath:'C:\\Videos\\clip.mov'})
+  const reasons=hdrBlockers(input)
+  assert.ok(!reasons.some(reason=>/codec=|profile=|pixel_format=|输出容器/.test(reason)),reasons.join('\n'))
+  const badSource=hdrBlockers({...input,video:{...input.video,color_transfer:'arib-std-b67'}})
+  assert.ok(badSource.some(reason=>reason.includes('color_transfer=arib-std-b67')))
+})
+
 // --- the opt-in is a request, not a guess --------------------------------------
 
 test('the switch defaults to off and the backend default is what the panel quotes', () => {

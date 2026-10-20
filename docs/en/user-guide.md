@@ -196,7 +196,7 @@ Preset management lists saved presets. Expand one to see changes from the defaul
 <a id="images"></a>
 ## Images and upscaling models
 
-Import PNG, JPEG, BMP, WebP, TIFF, AVIF and HEIC / HEIF images. The current input path handles ordinary 8-bit SDR images. High-bit-depth image input is not yet connected, and animated images use only the first frame.
+Import PNG, JPEG, BMP, WebP, TIFF, AVIF, HEIC / HEIF and JXR (JPEG XR) images. Ordinary images use 8-bit SDR; fully tagged BT.2020/PQ AVIF and scRGB HDR JXR (fixed/float) use the linear FP16 master. 16/32-bit integer JXR and other high-bit-depth SDR input are explicitly rejected; animated images use only the first frame.
 
 ### Single-frame rendering, memory and cached results
 
@@ -309,6 +309,8 @@ DLAA checks the local NGX cache by default. VSR, VFG and TrueHDR look for the re
 ### DLSSNR versions
 
 The manager supports local DLL / ZIP imports, trusted directories, version downloads and an independent cache. It checks SHA-256, the Windows signature, publisher, architecture, product and version. Old preview sessions close before a version switch. An ordinary DLSS DLL is not a DLSSNR library.
+
+Original and known community builds are identified. Other third-party DLLs can also be imported and selected automatically, with a one-time unidentified-DLL notice per file and no confirmation. File format and hash checks remain. New runtimes offer A/B models, with independent choices for layers 2 and 3. Switching closes the old pipeline before rebuilding; existing presets are preserved.
 
 Libraries retain their own licenses. Community version catalogs are not NVIDIA’s official releases, and a valid signature does not guarantee compatibility with every GPU, resolution or HDR combination. An active export prevents switching or removing its runtime.
 

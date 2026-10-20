@@ -18,6 +18,8 @@ import re
 import shutil
 import subprocess
 import sys
+import queue
+from native_watchdog import phase as native_phase
 import threading
 import time
 from collections import OrderedDict
@@ -166,12 +168,14 @@ def probe_pixel_info(path):
     try:
         cmd = [ffprobe, "-v", "error", "-select_streams", "v:0",
                "-show_entries",
-                 "stream=pix_fmt,bits_per_raw_sample,color_range,color_space,color_transfer,color_primaries,width,height:stream_side_data",
+                 "stream=codec_name,profile,pix_fmt,bits_per_raw_sample,color_range,color_space,color_transfer,color_primaries,width,height:stream_side_data",
                "-of", "json", path]
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10)
         s = (json.loads(res.stdout).get("streams") or [{}])[0]
         pix_fmt = str(s.get("pix_fmt") or "")
         info["pix_fmt"] = pix_fmt
+        info['codec_name'] = s.get('codec_name', '')
+        info['profile'] = s.get('profile', '')
         depth = 8
         try:
             raw_bits = int(s.get("bits_per_raw_sample") or 0)
@@ -593,6 +597,132 @@ def _is_cancelled(stop_event=None, cancel=None):
     return False
 
 
+class _DecoderPipeReader:
+    """One bounded background reader per FFmpeg stdout pipe.
+
+    Blocking reads happen once on this dedicated reader thread. The bounded
+    queue prevents decoded frames from accumulating when processing falls behind.
+    """
+    def __init__(self, stream):
+        self.stream = stream
+        self.fd = stream.fileno()
+        self.items = queue.Queue(maxsize=2)
+        self.requests = queue.Queue(maxsize=1)
+        self.stop_event = threading.Event()
+        self.pending = b""
+        self.eof = False
+        self.thread = threading.Thread(target=self._run, name="FFmpegPipeReader", daemon=True)
+        self.thread.start()
+
+    def _put(self, item):
+        while not self.stop_event.is_set():
+            try:
+                self.items.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _run(self):
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    remaining = self.requests.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                while remaining and not self.stop_event.is_set():
+                    target = min(262144, remaining)
+                    data = bytearray()
+                    while len(data) < target and not self.stop_event.is_set():
+                        chunk = os.read(self.fd, target - len(data))
+                        if not chunk:
+                            if data:
+                                self._put((data, None))
+                            self._put((None, None))
+                            return
+                        data.extend(chunk)
+                    if not self._put((data, None)):
+                        return
+                    remaining -= len(data)
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                self._put((None, exc))
+
+    def read(self, n, wait):
+        if self.pending:
+            if len(self.pending) <= n:
+                chunk, self.pending = self.pending, b""
+                return chunk
+            chunk, self.pending = self.pending[:n], self.pending[n:]
+            return chunk
+        if self.eof:
+            return b""
+        try:
+            data, error = self.items.get(timeout=wait)
+        except queue.Empty:
+            return None
+        if error is not None:
+            raise error
+        if data is None:
+            self.eof = True
+            return b""
+        if len(data) <= n:
+            return data
+        chunk, self.pending = data[:n], data[n:]
+        return chunk
+
+    def request(self, n):
+        if not self.eof:
+            self.requests.put_nowait(n)
+
+    def close(self):
+        self.stop_event.set()
+        if self.thread is not threading.current_thread():
+            self.thread.join(timeout=0.25)
+
+
+def _decoder_pipe_reader(proc, stream):
+    if proc is None:
+        return None
+    current = getattr(proc, "_lunarc_decoder_pipe_reader", None)
+    if current is not None and current.stream is stream:
+        return current
+    try:
+        current = _DecoderPipeReader(stream)
+    except (AttributeError, OSError, ValueError):
+        return None
+    try:
+        proc._lunarc_decoder_pipe_reader = current
+    except Exception:
+        current.close()
+        return None
+    return current
+
+
+def _stop_decoder_pipe_reader(proc):
+    reader = getattr(proc, "_lunarc_decoder_pipe_reader", None) if proc is not None else None
+    if reader is not None:
+        reader.close()
+        proc._lunarc_decoder_pipe_reader = None
+
+
+def _close_decoder_process(proc):
+    # End its writer before joining the reader or closing a pipe it is reading.
+    try:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=1)
+    except Exception:
+        pass
+    _stop_decoder_pipe_reader(proc)
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
 def _cancel_or(error, stop_event=None, cancel=None):
     """Relabel an IO error that happened during a cancel as that cancellation.
 
@@ -646,6 +776,10 @@ def _read_exactly(stream, n, proc=None, stop_event=None, cancel=None, timeout=No
     Returns short bytes only on graceful EOF (exit code 0 / untracked stream);
     an abnormal exit code raises. Raises JobCancelled on cancel.
     """
+    deadline = time.monotonic() + float(timeout) if timeout is not None else None
+    pipe_reader = _decoder_pipe_reader(proc, stream)
+    if pipe_reader is not None:
+        pipe_reader.request(n)
     buf = bytearray(n)
     view = memoryview(buf)
     pos = 0
@@ -656,13 +790,36 @@ def _read_exactly(stream, n, proc=None, stop_event=None, cancel=None, timeout=No
                     proc.kill()
                 except Exception:
                     pass
+                try:
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+                _stop_decoder_pipe_reader(proc)
             raise JobCancelled("用户已取消任务 (等待 %s 时中止)" % what)
+        if deadline is not None and time.monotonic() >= deadline:
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+                _stop_decoder_pipe_reader(proc)
+            raise RuntimeError("读取 %s 超时 (%.1f 秒)，已终止 FFmpeg 解码进程" % (what, timeout))
         try:
-            chunk = stream.read(min(262144, n - pos))
+            wait = 0.01 if deadline is None else min(0.01, max(0.0, deadline - time.monotonic()))
+            chunk = (pipe_reader.read(min(262144, n - pos), wait) if pipe_reader is not None
+                     else stream.read(min(262144, n - pos)))
         except Exception as e:
             raise _cancel_or(RuntimeError("读取 %s 失败: %s" % (what, e)), stop_event, cancel)
+        if chunk is None:
+            continue
         if not chunk:
-            rc = proc.poll() if proc is not None else None
+            if proc is None:
+                break
+            rc = proc.poll()
             if rc is not None:
                 break
             time.sleep(0.005)
@@ -681,31 +838,24 @@ def _read_exactly(stream, n, proc=None, stop_event=None, cancel=None, timeout=No
 
 
 def _popen_read_first(proc, nbytes, timeout=25):
-    """Read the first probe packet with a timeout (daemon thread + kill).
+    """Read the first probe packet with a bounded, cancellable pipe read.
 
     Prevents infinite block when the CUDA filter graph never produces output.
     Returns b"" on timeout/failure (caller falls back or raises).
     """
-    out = {}
-
-    def _r():
-        try:
-            out["data"] = proc.stdout.read(nbytes)
-        except Exception as e:
-            out["err"] = e
-
-    t = threading.Thread(target=_r, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    if t.is_alive():
+    try:
+        return _read_exactly(proc.stdout, nbytes, proc=proc, timeout=timeout,
+                             what="CUDA 首帧探测")
+    except RuntimeError:
         try:
             proc.kill()
         except Exception:
             pass
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass
         return b""
-    if "data" in out and out["data"]:
-        return out["data"]
-    return b""
 
 
 _CUDA_DECODE_CACHE = {}
@@ -730,6 +880,7 @@ def probe_cuda_decode_for_input(video_path: str, ffmpeg=None) -> tuple:
     if not is_static_ok:
         return False, static_reason, {"decode_actual": "cpu_fallback"}
 
+    proc = None
     try:
         n, fps, w, h = video_info(video_path)
         if w <= 0 or h <= 0:
@@ -745,22 +896,25 @@ def probe_cuda_decode_for_input(video_path: str, ffmpeg=None) -> tuple:
             "-pix_fmt", "bgr24",
             "-"
         ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
         raw = _popen_read_first(proc, expected_bytes, timeout=10)
         proc.poll()
         if proc.returncode not in (None, 0) or len(raw) < expected_bytes:
+            # stderr.read() waits for EOF too: stop the writer before reading it.
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=1)
             err = proc.stderr.read().decode('utf-8', 'replace') if proc.stderr else "Incomplete frame read"
-            try: proc.kill()
-            except: pass
             return False, f"CUDA decode failed for input: {err}", {"decode_actual": "cpu_fallback"}
 
-        try: proc.kill()
-        except: pass
         return True, "CUDA hardware decode verified", {
             "decode_actual": "cuda", "width": w, "height": h, "fps": fps
         }
     except Exception as e:
         return False, f"Dynamic probe error: {e}", {"decode_actual": "cpu_fallback"}
+    finally:
+        if proc is not None:
+            _close_decoder_process(proc)
 
 
 def probe_cuda_decode_capability(ffmpeg=None) -> tuple:
@@ -836,7 +990,7 @@ def iter_frames(path, limit=None, decode_mode="auto", stop_event=None, cancel=No
             "-pix_fmt", "bgr24",
             "-"
         ]
-        proc = subprocess.Popen(cmd_cpu, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=frame_bytes_bgr * 4)
+        proc = subprocess.Popen(cmd_cpu, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
         if callable(on_proc_started):
             try: on_proc_started(proc)
             except Exception: pass
@@ -847,7 +1001,7 @@ def iter_frames(path, limit=None, decode_mode="auto", stop_event=None, cancel=No
                     raise JobCancelled("用户已取消任务 (解码中)")
                 if limit is not None and i >= limit:
                     break
-                raw = _read_exactly(proc.stdout, frame_bytes_bgr, proc=proc, stop_event=stop_event, cancel=cancel, what="CPU BGR 帧")
+                raw = _read_exactly(proc.stdout, frame_bytes_bgr, proc=proc, stop_event=stop_event, cancel=cancel, timeout=90, what="CPU BGR 帧")
                 if len(raw) < frame_bytes_bgr:
                     break
                 transfer_profiler.DECODER_PIPE.note_frame(i, len(raw))
@@ -855,8 +1009,7 @@ def iter_frames(path, limit=None, decode_mode="auto", stop_event=None, cancel=No
                 yield i, f
                 i += 1
         finally:
-            try: proc.kill()
-            except Exception: pass
+            _close_decoder_process(proc)
             if callable(on_proc_exited):
                 try: on_proc_exited(proc)
                 except Exception: pass
@@ -888,7 +1041,7 @@ def iter_frames(path, limit=None, decode_mode="auto", stop_event=None, cancel=No
                 "-pix_fmt", "nv12",
                 "-"
             ]
-            test_proc = subprocess.Popen(cmd_nv12, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=frame_bytes_nv12 * 4)
+            test_proc = subprocess.Popen(cmd_nv12, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             if callable(on_proc_started):
                 try: on_proc_started(test_proc)
                 except Exception: pass
@@ -900,8 +1053,7 @@ def iter_frames(path, limit=None, decode_mode="auto", stop_event=None, cancel=No
                 if isinstance(decode_info, dict):
                     decode_info["actual"] = "cuda"
             else:
-                try: test_proc.kill()
-                except Exception: pass
+                _close_decoder_process(test_proc)
                 if callable(on_proc_exited):
                     try: on_proc_exited(test_proc)
                     except Exception: pass
@@ -942,7 +1094,7 @@ def iter_frames(path, limit=None, decode_mode="auto", stop_event=None, cancel=No
             "-pix_fmt", "bgr24",
             "-"
         ]
-        proc = subprocess.Popen(cmd_cpu, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=frame_bytes_bgr * 4)
+        proc = subprocess.Popen(cmd_cpu, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
         if callable(on_proc_started):
             try: on_proc_started(proc)
             except Exception: pass
@@ -977,14 +1129,7 @@ def iter_frames(path, limit=None, decode_mode="auto", stop_event=None, cancel=No
             yield i, frame
             i += 1
     finally:
-        try:
-            proc.stdout.close()
-        except Exception:
-            pass
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        _close_decoder_process(proc)
         if callable(on_proc_exited):
             try:
                 on_proc_exited(proc)
@@ -3634,6 +3779,7 @@ def export_dlss_stream(video, live, lock=None, frames=None, fps=None, cq=24, wit
             t_frame_start = time.perf_counter()
 
             # Execute unified production processing core
+            native_phase(f'处理导出第 {idx + 1} 帧', 300)
             final_bgr, record_dict = core.process_frame(
                 idx=idx, fr=fr, is_discontinuous=is_discontinuous, decode_wait_ms=t_decode_wait
             )
@@ -3689,6 +3835,7 @@ def export_dlss_stream(video, live, lock=None, frames=None, fps=None, cq=24, wit
             if diagnostics_out is not None:
                 diagnostics_out.update(backend_diagnostics)
         core.close()
+        native_phase('等待 FFmpeg 编码结束', None)
         if callable(on_proc_exited):
             try:
                 on_proc_exited(proc)

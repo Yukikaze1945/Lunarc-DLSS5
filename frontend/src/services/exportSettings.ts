@@ -2,7 +2,7 @@ import type {TranscodeSettings} from '../types'
 export const TRANSCODE_DRAFT_KEY = 'lunarc.transcodeDraft'
 export const TRANSCODE_DRAFT_VERSION = 1
 const DRAFT_ENUMS: Partial<Record<keyof TranscodeSettings, readonly string[]>> = {
-  codec: ['av1_nvenc', 'hevc_nvenc', 'h264_nvenc'],
+  codec: ['av1_nvenc', 'hevc_nvenc', 'h264_nvenc', 'prores_ks'],
   container: ['.mkv', '.mp4', '.mov', '.webm'],
   rate_mode: ['cq', 'constqp', 'cbr', 'vbr'],
   peak_policy: ['auto', 'custom'],
@@ -19,11 +19,11 @@ const DRAFT_ENUMS: Partial<Record<keyof TranscodeSettings, readonly string[]>> =
   aq_mode: ['spatial', 'temporal', 'disabled'],
   temporal_filter: ['auto', '0', '1', '2', '3', '4'],
   split_encode: ['auto', 'disabled', '2', '3', '4'],
-  profile: ['auto', 'main', 'main10', 'high'],
+  profile: ['auto', 'main', 'main10', 'high', 'hq'],
   tier: ['auto', 'main', 'high'],
     resolution_mode: ['original', 'source', 'double', 'half', '7680x4320', '5120x2880', '3840x2160', '2560x1440', '1920x1080', '1280x720', 'custom_size', 'custom_factor'],
   scale_algorithm: ['lanczos', 'bicubic', 'bilinear', 'nearest'],
-  pixel_format: ['auto', 'yuv420p', 'nv12', 'p010le', 'p016le', 'nv16', 'p210le', 'p216le', 'yuv444p', 'yuv444p10msble', 'yuv444p16le'],
+  pixel_format: ['auto', 'yuv420p', 'nv12', 'p010le', 'p016le', 'nv16', 'p210le', 'p216le', 'yuv422p10le', 'yuv444p', 'yuv444p10msble', 'yuv444p16le'],
   color_preset: ['preserve', 'bt709_limited', 'bt709_full', 'bt2020_sdr', 'bt2020_pq', 'bt2020_hlg', 'hdr_to_sdr', 'custom'],
   custom_color_range: ['tv', 'pc'],
   audio_mode: ['copy', 'aac', 'opus', 'flac', 'pcm', 'remove'],

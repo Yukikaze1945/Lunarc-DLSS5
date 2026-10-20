@@ -51,6 +51,7 @@ import {
   hdrBlockers, isHdrRequested,
 } from '../services/hdrExport'
 import { hasExportControls } from '../services/qualityControls'
+import { reconstructionExportBlockers } from '../services/deliverValidation'
 import {exportOptions, normalizeExportOptions} from '../services/exportOptions'
 import { subscribeQueue, refreshQueue } from '../services/queue'
 import './deliver.css'
@@ -149,6 +150,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
   const selection=useFrameSelection(video?.path)
   useEffect(()=>publishExportSettings(txSettings),[txSettings])
   const choices = exportOptions(dlssSettings, video, txSettings)
+  const isProres = txSettings.codec === 'prores_ks'
   const [activeSection, setActiveSection] = useState<'basic' | 'video' | 'color' | 'tracks' | 'advanced'>('basic')
   const [fileName, setFileName] = useState<string>('')
   const [outputDir, setOutputDir] = useState<string>('')
@@ -157,6 +159,9 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
   useEffect(() => {
     if (txDraft !== txSettings) { setTxSettings(txSettings); setSelectedPresetIdx(-1) }
   }, [txDraft, txSettings])
+  useEffect(() => {
+    if (isProres) { setActiveSection('basic'); setAdvancedOpen(false) }
+  }, [isProres])
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false)
   const [justAdded, setJustAdded] = useState<boolean>(false)
 
@@ -410,10 +415,10 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
     issues.push(...nativeOutputBlockers(dlssSettings, video).map(text=>({type:'error' as const,text})))
 
     if (hasExportControls(dlssSettings) && dlssSettings.export_backend !== 'gpu_transfer') {
-      issues.push({ type: 'error', text: '残差后处理或时间控制已启用，但当前导出后端不支持这些控制。请切换到 GPU Transfer，或在 DLSS 页恢复默认控制。' })
+      issues.push({ type: 'error', text: '残差后处理或时间控制已启用，但当前导出后端不支持。请切换到 GPU Transfer。' })
     }
 
-    if (sdr10On) {
+    if (sdr10On && !isProres) {
       if (!['hevc_nvenc', 'av1_nvenc'].includes(txSettings.codec) || txSettings.container !== '.mkv')
         issues.push({ type: 'error', text: 'SDR 10-bit 导出请选择 HEVC 或 AV1，封装为 MKV。' })
       if (!['auto', 'p010le', 'yuv420p10le'].includes(txSettings.pixel_format))
@@ -423,7 +428,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
       if (txSettings.color_preset !== 'preserve')
         issues.push({ type: 'error', text: 'SDR 10-bit 请选择保留源色彩。' })
     }
-    if (!hdrOn && !sdr10On && dlssSettings.export_backend === 'gpu_transfer' && !['auto', 'yuv420p'].includes(txSettings.pixel_format)) {
+    if (!isProres && !hdrOn && !sdr10On && dlssSettings.export_backend === 'gpu_transfer' && !['auto', 'yuv420p'].includes(txSettings.pixel_format)) {
       issues.push({ type: 'error', text: 'SDR GPU Transfer 的像素格式请选择 Auto 或 YUV420P；编码器实际提交 NV12 8-bit 4:2:0。其他像素格式只适用于相应的普通导出链。' })
     }
 
@@ -431,20 +436,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
       issues.push({ type: 'error', text: 'H.264 NVENC 不支持 UHQ 调优，请改用 HQ 或选择 AV1 / HEVC' })
     }
 
-    if (dlssSettings.reconstruction_mode !== 'single') {
-      if (dlssSettings.export_backend !== 'gpu_transfer') {
-        issues.push({ type: 'error', text: 'Dual / Triple 独立多尺度层只支持 GPU Transfer 导出' })
-      }
-      const count = dlssSettings.reconstruction_mode === 'triple' ? 3 : 2
-      const scales = dlssSettings.layer_scales || []
-      if (scales.length !== count ||
-          Math.round((scales[0] || 0) * 100) !== Math.round(dlssSettings.working_scale * 100) ||
-          scales.some((scale) => !Number.isFinite(scale) || scale < 0.25 || scale > 1 ||
-            Math.abs(scale * 100 - Math.round(scale * 100)) > 1e-6) ||
-          new Set(scales.map((scale) => Math.round(scale * 100))).size !== count) {
-        issues.push({ type: 'error', text: '每层需使用不同的 25–100% 整数比例，且第 1 层须等于工作分辨率' })
-      }
-    }
+    issues.push(...reconstructionExportBlockers(dlssSettings).map(text => ({type: 'error' as const, text})))
 
     if (txSettings.weighted_prediction) {
       if (txSettings.codec === 'av1_nvenc') {
@@ -648,7 +640,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
           </div>
           <div className="h-4 w-px bg-lunarc-border" />
           {/* Preset Selector */}
-          <div className="flex items-center space-x-2">
+          {!isProres && <div className="flex items-center space-x-2">
             <span className="text-xs text-lunarc-muted">{ui("预设方案:")}</span>
             <select
               value={selectedPresetIdx}
@@ -662,7 +654,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
                 </option>
               )))}
             </select>
-          </div>
+          </div>}
         </div>
 
         <div className="flex items-center space-x-3">
@@ -679,7 +671,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
           </div>
 
           {/* Advanced Drawer Button */}
-          <button
+          {!isProres && <button
             onClick={() => { setActiveSection('advanced'); setAdvancedOpen(!advancedOpen) }}
             className={`flex items-center space-x-1.5 px-3.5 py-1.5 text-xs font-medium rounded transition-all ${
               advancedOpen
@@ -689,7 +681,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
           >
             <Settings2 className="w-3.5 h-3.5" />
             <span>{ui(advancedOpen ? '收起高级 NVENC' : '高级 NVENC')}</span>
-          </button>
+          </button>}
         </div>
       </div>
 
@@ -703,6 +695,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
             {ui(([
               ['basic', '基础'], ['video', '视频'], ['color', '色彩'], ['tracks', '音轨封装'], ['advanced', '高级'],
             ] as const).map(([key, label]) => (
+              isProres && key === 'advanced' ? null :
               <button key={key} type="button" aria-current={activeSection === key ? 'page' : undefined}
                 onClick={() => { setActiveSection(key); if (key === 'advanced') setAdvancedOpen(true); else setAdvancedOpen(false) }}
                 className={`min-h-9 shrink-0 rounded-sm px-4 text-xs font-semibold transition ${activeSection === key ? 'bg-lunarc-accent text-[var(--accent-ink)]' : 'text-lunarc-muted hover:bg-lunarc-panel hover:text-lunarc-text'}`}>
@@ -767,6 +760,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
                   <option value="av1_nvenc" disabled={Boolean(choices.codec && !choices.codec.includes("av1_nvenc"))}>{ui("AV1 NVENC (RTX 40/50 系列)")}</option>
                   <option value="hevc_nvenc" disabled={Boolean(choices.codec && !choices.codec.includes("hevc_nvenc"))}>HEVC NVENC (H.265)</option>
                   <option value="h264_nvenc" disabled={Boolean(choices.codec && !choices.codec.includes("h264_nvenc"))}>H.264 NVENC (AVC)</option>
+                  <option value="prores_ks" disabled={Boolean(choices.codec && !choices.codec.includes("prores_ks"))}>ProRes 422 HQ (CPU)</option>
                 </select>
               </div>
 
@@ -784,7 +778,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
                 </select>
               </div>
 
-              <div>
+              <div className={isProres ? 'hidden' : ''}>
                 <label className="text-[11px] text-lunarc-muted mb-1 block">{ui("预设档位")}</label>
                 <select
                   value={txSettings.preset}
@@ -801,7 +795,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
                 </select>
               </div>
 
-              <div>
+              <div className={isProres ? 'hidden' : ''}>
                 <label className="text-[11px] text-lunarc-muted mb-1 block">{ui("调优策略")}</label>
                 <select
                   value={txSettings.tune}
@@ -817,7 +811,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
                 </select>
               </div>
 
-              <div>
+              <div className={isProres ? 'hidden' : ''}>
                 <label className="text-[11px] text-lunarc-muted mb-1 block">{ui("多遍编码")}</label>
                 <select
                   value={txSettings.multipass}
@@ -831,7 +825,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
                 </select>
               </div>
 
-              <div>
+              <div className={isProres ? 'hidden' : ''}>
                 <label className="text-[11px] text-lunarc-muted mb-1 block">{ui("解码模式")}</label>
                 <select
                   value={txSettings.decode_mode}
@@ -860,7 +854,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
           </div>
 
           {/* Group 2: 码率控制 (Rate Control) */}
-          <div className={`bg-lunarc-surface border border-lunarc-border rounded-sm p-4 space-y-4 ${activeSection !== 'basic' ? 'hidden' : ''}`}>
+          <div className={`bg-lunarc-surface border border-lunarc-border rounded-sm p-4 space-y-4 ${activeSection !== 'basic' || isProres ? 'hidden' : ''}`}>
             <div className="flex items-center justify-between">
               <div className="text-xs font-bold text-lunarc-text uppercase tracking-wider flex items-center space-x-1.5">
                 <Sliders className="w-4 h-4 text-lunarc-accent" />
@@ -971,6 +965,11 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
             ))}
           </div>
 
+          {isProres && <div className={`bg-lunarc-surface border border-lunarc-border rounded-sm p-4 text-xs leading-relaxed text-lunarc-muted ${activeSection !== 'basic' ? 'hidden' : ''}`}>
+            <strong className="block mb-1 text-lunarc-text">{ui("ProRes 422 HQ · 固定输出")}</strong>
+            {ui("profile 3 · 10-bit 4:2:2 · MOV。图像阶段仍在 GPU 渲染，渲染帧传回主机内存后由 CPU prores_ks 编码；不使用 NVENC 预设或码控。")}
+          </div>}
+
           {/* Group 3: 缩放与色彩 (Scaling & Color) */}
           <div className={`bg-lunarc-surface border border-lunarc-border rounded-sm p-4 space-y-4 ${activeSection !== 'video' && activeSection !== 'color' ? 'hidden' : ''}`}>
             <div className="text-xs font-bold text-lunarc-text uppercase tracking-wider flex items-center space-x-1.5">
@@ -1019,6 +1018,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
                 <label className="text-[11px] text-lunarc-muted mb-1 block">{ui("像素格式")}</label>
                 <select
                   value={txSettings.pixel_format}
+                  disabled={isProres}
                   onChange={(e) => updateSetting('pixel_format', e.target.value)}
                   className="w-full bg-lunarc-dark border border-lunarc-border focus:border-lunarc-accent rounded px-3 py-1.5 text-xs text-lunarc-text focus:outline-none"
                 >
@@ -1032,6 +1032,7 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
                   <option value="nv16" disabled={Boolean(choices.pixel_format && !choices.pixel_format.includes("nv16"))}>{ui("NV16 · 4:2:2 · 8-bit · 兼容转换")}</option>
                   <option value="p210le" disabled={Boolean(choices.pixel_format && !choices.pixel_format.includes("p210le"))}>P210 · 10-bit</option>
                   <option value="p216le" disabled={Boolean(choices.pixel_format && !choices.pixel_format.includes("p216le"))}>P216 · 16-bit</option>
+                  <option value="yuv422p10le" disabled={Boolean(choices.pixel_format && !choices.pixel_format.includes("yuv422p10le"))}>YUV422P10 · 4:2:2 · 10-bit</option>
                   <option value="yuv444p" disabled={Boolean(choices.pixel_format && !choices.pixel_format.includes("yuv444p"))}>{ui("YUV444P · 4:4:4 · 8-bit · 兼容转换")}</option>
                   <option value="yuv444p10msble" disabled={Boolean(choices.pixel_format && !choices.pixel_format.includes("yuv444p10msble"))}>{ui("YUV444P10MSB · 4:4:4 · 10-bit（已禁用）")}</option>
                   <option value="yuv444p16le" disabled={Boolean(choices.pixel_format && !choices.pixel_format.includes("yuv444p16le"))}>{ui("YUV444P16 · 4:4:4 · 16-bit（已禁用）")}</option>
@@ -1219,11 +1220,11 @@ export const DeliverPage: React.FC<DeliverPageProps> = React.memo(({
         {/* Right Drawer / Preview Sidebar */}
         <div
           className={`border-l border-lunarc-border bg-lunarc-dark flex flex-col transition-all duration-300 ${
-            advancedOpen ? 'w-[420px] shrink-0' : 'hidden'
+            advancedOpen && !isProres ? 'w-[420px] shrink-0' : 'hidden'
           }`}
         >
           {/* If Advanced Drawer is OPEN */}
-          {ui(advancedOpen ? (
+          {ui(advancedOpen && !isProres ? (
             <div className="flex-1 flex flex-col h-full overflow-hidden">
               <div className="p-4 border-b border-lunarc-border flex items-center justify-between flex-shrink-0 bg-lunarc-surface">
                 <div className="flex items-center space-x-2">

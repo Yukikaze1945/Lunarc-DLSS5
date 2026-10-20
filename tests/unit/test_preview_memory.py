@@ -56,9 +56,20 @@ def test_service_rejects_release_during_export_and_keeps_manual_pause_until_resu
     service.active_job_id=None;service.begin_preview_release()
     assert service.render_preview(0)==(None,'GPU_PREVIEW_RELEASED')
     assert service.release_preview_memory()=={'released':True}
-    with pytest.raises(ValueError,match='等待'):service.resume_preview_memory()
-    service._preview_release_busy=False
+    assert not service.preview_memory_state()['releasing']
     assert not service.resume_preview_memory()['suspended']
+
+
+def test_failed_release_does_not_leave_the_service_permanently_busy():
+    service = fake_service()
+    def fail():raise RuntimeError('release failed')
+    service._get_gpu_preview = lambda: SimpleNamespace(release_memory=fail)
+    service.begin_preview_release()
+    with pytest.raises(RuntimeError, match='release failed'):
+        service.release_preview_memory()
+    state = service.preview_memory_state()
+    assert state['suspended'] and not state['releasing']
+    assert state['error'] == 'release failed'
 
 def test_suspension_invalidates_inflight_frame_and_rejects_refresh_until_resume():
     from tests.unit.test_preview_player import Socket,Service,until,close

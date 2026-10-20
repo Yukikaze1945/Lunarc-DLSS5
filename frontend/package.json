@@ -1,7 +1,7 @@
 {
   "name": "lunarc-workbench",
   "private": true,
-  "version": "1.3.0",
+  "version": "1.4.0",
   "main": "dist-electron/main.js",
   "type": "module",
   "scripts": {

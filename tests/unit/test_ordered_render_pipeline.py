@@ -117,6 +117,7 @@ def test_hdr_source_cut_resets_prefix_before_it_consumes_the_picture():
     events = []
     plane = SimpleNamespace(as_descriptor=lambda: dict(format='rgba16f_cuda', device_ptr=7))
     chain = object.__new__(HdrChain)
+    chain.prores_input = False
     chain.preview_consumer = None
     chain.bridge = SimpleNamespace(decode=lambda **kw: plane, source_report=lambda: {},
         import_master=lambda value: plane, downscale=lambda: plane,

@@ -693,7 +693,11 @@ void main_decode(uint3 id : SV_DispatchThreadID) {
     float ys0, ys1;
     unpack_p010(yWord, ys0, ys1);
     float ySample = (id.x & 1u) ? ys1 : ys0;
+    #ifdef P210_INPUT
+    uint cWord = SourceUV.Load(id.y * SourceUVPitch + (id.x >> 1) * 4u);
+#else
     uint cWord = SourceUV.Load((id.y >> 1) * SourceUVPitch + (id.x >> 1) * 4u);
+#endif
     float cbSample, crSample;
     unpack_p010(cWord, cbSample, crSample);
     // AVColorRange full-range uses 1023 for both scales and chroma centre 512.
@@ -747,7 +751,11 @@ void main_decode(uint3 id : SV_DispatchThreadID) {
     float ys0, ys1;
     unpack_p010(yWord, ys0, ys1);
     float yCode = (id.x & 1u) ? ys1 : ys0;
+    #ifdef P210_INPUT
+    uint cWord = SourceUV.Load(id.y * SourceUVPitch + (id.x >> 1) * 4u);
+#else
     uint cWord = SourceUV.Load((id.y >> 1) * SourceUVPitch + (id.x >> 1) * 4u);
+#endif
     float cbCode, crCode;
     unpack_p010(cWord, cbCode, crCode);
     float Y = y_from_code(yCode);
@@ -1125,10 +1133,10 @@ void luma_code_for(float3 scrgb, uint row, uint column, uint pitch,
 }
 [numthreads(8, 8, 1)]
 void main_encode(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= (Width >> 1) || id.y >= (Height >> 1)) return;
-    uint baseX = id.x * 2u, baseY = id.y * 2u;
+    if (id.x >= (Width >> 1) || id.y >= (P210_OUTPUT ? Height : (Height >> 1))) return;
+    uint baseX = id.x * 2u, baseY = P210_OUTPUT ? id.y : id.y * 2u;
     precise float3 total = float3(0.0, 0.0, 0.0);
-    for (uint dy = 0u; dy < 2u; ++dy)
+    for (uint dy = 0u; dy < (P210_OUTPUT ? 1u : 2u); ++dy)
         for (uint dx = 0u; dx < 2u; ++dx) {
             float3 scrgb = load16(Source, baseY + dy, baseX + dx,
                 SourcePitch).rgb;
@@ -1141,7 +1149,7 @@ void main_encode(uint3 id : SV_DispatchThreadID) {
     /* Colour difference is quarter resolution and one encoded mean serves the
      * block; the 4:2:0 UV plane interleaves U and V, so the block owns one
      * whole 32-bit word. */
-    precise float3 mean = total * 0.25;
+    precise float3 mean = total * (P210_OUTPUT ? 0.5 : 0.25);
     float3 encodedMean = encode_relative(mean);
     precise float yMean = KR * encodedMean.r + KG * encodedMean.g +
         KB * encodedMean.b;
@@ -1202,10 +1210,10 @@ void luma_code_for(float3 linearRgb, uint row, uint column, uint pitch,
 }
 [numthreads(8, 8, 1)]
 void main_encode(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= (Width >> 1) || id.y >= (Height >> 1)) return;
-    uint baseX = id.x * 2u, baseY = id.y * 2u;
+    if (id.x >= (Width >> 1) || id.y >= (P210_OUTPUT ? Height : (Height >> 1))) return;
+    uint baseX = id.x * 2u, baseY = P210_OUTPUT ? id.y : id.y * 2u;
     precise float3 encoded_total = float3(0.0f, 0.0f, 0.0f);
-    for (uint dy = 0u; dy < 2u; ++dy)
+    for (uint dy = 0u; dy < (P210_OUTPUT ? 1u : 2u); ++dy)
         for (uint dx = 0u; dx < 2u; ++dx) {
             float3 linearRgb = load16(Source, baseY + dy, baseX + dx, SourcePitch).rgb;
             encoded_total += quantizer_linear(linearRgb);
@@ -1216,7 +1224,7 @@ void main_encode(uint3 id : SV_DispatchThreadID) {
     /* 4:2:0 chroma is the mean of encoded RGB samples. OETF is nonlinear, so
      * averaging linear RGB before encoding would shift saturated blocks. Pixel
      * clipping counters are intentionally charged only by luma_code_for. */
-    float3 encoded = encoded_total * 0.25f;
+    float3 encoded = encoded_total * (P210_OUTPUT ? 0.5f : 0.25f);
     float y = 0.2126f * encoded.r + 0.7152f * encoded.g + 0.0722f * encoded.b;
     float cb = (encoded.b - y) / (2.0f * (1.0f - 0.0722f));
     float cr = (encoded.r - y) / (2.0f * (1.0f - 0.2126f));
@@ -1474,7 +1482,7 @@ void layout_planes(Bridge* b, const GpuHdrTapTable& downscale,
      * and the float32 scratch one contiguous block of full x low float4s. */
     const Request requests[] = {
         {kPlaneSourceY, full * 2u, full_h},
-        {kPlaneSourceUV, full * 2u, full_h / 2u},
+        {kPlaneSourceUV, full * 2u, (b->purpose == GPU_HDR_PURPOSE_DECODE422 ? full_h : full_h / 2u)},
         {kPlaneMaster, full * 8u, full_h},
         {kPlaneWorking, low * 8u, low_h},
         {kPlaneProxy, low * 8u, low_h},
@@ -1483,19 +1491,19 @@ void layout_planes(Bridge* b, const GpuHdrTapTable& downscale,
         {kPlaneResidual, low * 8u, low_h},
         {kPlaneComposited, full * 8u, full_h},
         {kPlaneEncodeY, full * 2u, full_h},
-        {kPlaneEncodeUV, full * 2u, full_h / 2u},
+        {kPlaneEncodeUV, full * 2u, (b->purpose == GPU_HDR_PURPOSE_ENCODE422 ? full_h : full_h / 2u)},
         {kPlaneScratch, full * low_h * 16u, 1u},
         {kPlaneCounters, kCounterSlots * 4u, 1u},
     };
     for (const Request& r : requests) {
         const bool needed = b->purpose == GPU_HDR_PURPOSE_FULL || r.id == kPlaneCounters ||
             r.id == kPlaneMaster ||
-            (b->purpose == GPU_HDR_PURPOSE_DECODE &&
+            ((b->purpose == GPU_HDR_PURPOSE_DECODE || b->purpose == GPU_HDR_PURPOSE_DECODE422) &&
                 (r.id == kPlaneSourceY || r.id == kPlaneSourceUV)) ||
             (b->purpose == GPU_HDR_PURPOSE_GUIDANCE &&
                 (r.id == kPlaneWorking || r.id == kPlaneProxy ||
                  r.id == kPlaneGuidance || r.id == kPlaneScratch)) ||
-            (b->purpose == GPU_HDR_PURPOSE_ENCODE &&
+            ((b->purpose == GPU_HDR_PURPOSE_ENCODE || b->purpose == GPU_HDR_PURPOSE_ENCODE422) &&
                 (r.id == kPlaneComposited || r.id == kPlaneEncodeY || r.id == kPlaneEncodeUV));
         if (!needed) continue;
         if (FAILED(create_plane(b, r.id, r.bytes_per_row, r.rows, true, true))) {
@@ -1833,10 +1841,12 @@ void derive_contract() {
 
 /* Assembles one pass's shader: the derived contract, the shared sample helpers,
  * the proxy curve, then the pass body. */
-std::string pass_source(PassId pass, bool sdr10_mode) {
+std::string pass_source(PassId pass, bool sdr10_mode, bool p210_mode) {
     std::string text = colour_header();
     text += numeric_header;
     text += sample_header;
+    if (p210_mode && pass == kPassDecode) text += "#define P210_INPUT 1\n";
+    if (pass == kPassEncode) text += p210_mode ? "#define P210_OUTPUT 1\n" : "#define P210_OUTPUT 0\n";
     if (sdr10_mode && (pass == kPassProxy || pass == kPassResidual)) text += "#define SDR10_NR 1\n";
     if (pass == kPassProxy || pass == kPassResidual) text += proxy_header();
     if (pass == kPassResidual) text += half_stops_helper;
@@ -2343,7 +2353,7 @@ static int32_t gpu_hdr_open_impl(
     uint32_t purpose = GPU_HDR_PURPOSE_FULL) {
     error_reset();
     if (out_bridge) *out_bridge = nullptr;
-    if (purpose > GPU_HDR_PURPOSE_ENCODE) { say("unknown HDR bridge purpose"); return -1; }
+    if (purpose > GPU_HDR_PURPOSE_ENCODE422) { say("unknown HDR bridge purpose"); return -1; }
     if (sdr10_mode && paper_white_scrgb != 1.0) {
         say("SDR10 reference white is fixed at 1.0 relative-linear unit");
         return -1;
@@ -2423,10 +2433,10 @@ static int32_t gpu_hdr_open_impl(
     b->purpose = purpose;
     for (uint32_t p = 0; p < kPassCount; ++p)
         b->pass_enabled[p] = purpose == GPU_HDR_PURPOSE_FULL ||
-            (purpose == GPU_HDR_PURPOSE_DECODE && p == kPassDecode) ||
+            ((purpose == GPU_HDR_PURPOSE_DECODE || purpose == GPU_HDR_PURPOSE_DECODE422) && p == kPassDecode) ||
             (purpose == GPU_HDR_PURPOSE_GUIDANCE &&
                 (p == kPassVertical || p == kPassHorizontal || p == kPassProxy)) ||
-            (purpose == GPU_HDR_PURPOSE_ENCODE && p == kPassEncode);
+            ((purpose == GPU_HDR_PURPOSE_ENCODE || purpose == GPU_HDR_PURPOSE_ENCODE422) && p == kPassEncode);
     b->actionable_relative = contract_probe.proxy_actionable_relative > 0.0
         ? contract_probe.proxy_actionable_relative : kProxyActionableFallback;
     b->saturation_relative = contract_probe.proxy_saturation_relative > 0.0
@@ -2505,7 +2515,7 @@ static int32_t gpu_hdr_open_impl(
     if (FAILED(make_heap(b))) { delete b; return -1; }
     for (uint32_t p = 0; p < kPassCount; ++p) {
         if (!b->pass_enabled[p]) continue;
-        const std::string source = pass_source(PassId(p), sdr10_mode);
+        const std::string source = pass_source(PassId(p), sdr10_mode, purpose == GPU_HDR_PURPOSE_DECODE422 || purpose == GPU_HDR_PURPOSE_ENCODE422);
         if (!build_pipeline(b, PassId(p), source.c_str(),
                             b->bindings[p].entry)) {
             delete b;
@@ -2635,10 +2645,11 @@ static int32_t gpu_decode_impl(
     ContextScope scope(&b->cuda, b->context);
     if (!scope.ok) return -1;
     const uint32_t luma_bytes = b->full_w * 2u;
+    const uint32_t uv_rows = b->purpose == GPU_HDR_PURPOSE_DECODE422 ? b->full_h : b->full_h / 2u;
     if (!copy_device_to_device(b, p010_y_ptr, uint32_t(p010_y_pitch),
             b->planes[kPlaneSourceY], luma_bytes, b->full_h, "source luma") ||
         !copy_device_to_device(b, p010_uv_ptr, uint32_t(p010_uv_pitch),
-            b->planes[kPlaneSourceUV], luma_bytes, b->full_h / 2u,
+            b->planes[kPlaneSourceUV], luma_bytes, uv_rows,
             "source colour difference"))
         return -1;
     b->support_ceiling = support_ceiling_scrgb;
@@ -2653,7 +2664,7 @@ static int32_t gpu_decode_impl(
         return -1;
     b->counters_state.process_count += 1;
     b->counters_state.source_device_copy_bytes +=
-        uint64_t(luma_bytes) * b->full_h + uint64_t(luma_bytes) * b->full_h / 2u;
+        uint64_t(luma_bytes) * b->full_h + uint64_t(luma_bytes) * uv_rows;
     b->counters_state.source_device_write_bytes +=
         uint64_t(b->full_w) * b->full_h * 8u;
     if (counter(b, kPassDecode, kSrcNonfinite) != 0) {
@@ -2950,11 +2961,13 @@ extern "C" GPU_HDR_API int32_t gpu_hdr_encode(
     c.put(0u); c.put(0u); c.put(0u);
     c.put(float(clip_ceiling_scrgb));
     if (!run_pass(b, kPassEncode, c, groups(b->full_w / 2u, 8u),
-                  groups(b->full_h / 2u, 8u)))
+                  groups((b->purpose == GPU_HDR_PURPOSE_ENCODE422 ? b->full_h : b->full_h / 2u), 8u)))
         return -1;
+    const uint32_t output_uv_rows = b->purpose == GPU_HDR_PURPOSE_ENCODE422
+        ? b->full_h : b->full_h / 2u;
     b->counters_state.encode_device_write_bytes +=
         uint64_t(b->full_w) * b->full_h * 2u +
-        uint64_t(b->full_w) * b->full_h;
+        uint64_t(b->full_w) * output_uv_rows * 2u;
     if (out_y_ptr) *out_y_ptr = b->planes[kPlaneEncodeY].mapped;
     if (out_y_pitch) *out_y_pitch = b->planes[kPlaneEncodeY].pitch;
     if (out_uv_ptr) *out_uv_ptr = b->planes[kPlaneEncodeUV].mapped;

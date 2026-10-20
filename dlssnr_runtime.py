@@ -37,6 +37,20 @@ KNOWN_VERSIONS = {
     }
 }
 
+# Identity allowlist only, not a download catalog or a claim of GPU validation.
+# OpenNR profiles/compat-fp16-310.9.16.json pins this reference output.
+COMMUNITY_VERSIONS = {
+    'cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed': {
+        'version': '310.9.16.0', 'bytes': 276162560,
+        'publisher': 'ShortFuse / OpenNR',
+        'reference': 'https://github.com/clshortfuse/openNR/blob/main/profiles/compat-fp16-310.9.16.json',
+    },
+}
+MODEL_AB_HASHES = frozenset(COMMUNITY_VERSIONS) | {
+    # NVIDIA base input pinned independently by the same OpenNR profile.
+    '2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f',
+}
+
 
 class RuntimeErrorDetail(RuntimeError):
     def __init__(self, code, message):
@@ -75,7 +89,7 @@ def check_pe(path):
 
 def windows_identity(path):
     if os.name != 'nt':
-        fail('signature_unavailable', '数字签名校验需要 Windows；不会跳过此校验')
+        fail('signature_unavailable', '数字签名信息需要 Windows 才能读取')
     # Literal environment input, never interpolate a user path into shell code.
     script = r'''
 $ErrorActionPreference = 'Stop'
@@ -100,7 +114,7 @@ $v = (Get-Item -LiteralPath $p).VersionInfo
             fail('signature_unavailable', 'Windows 签名校验失败，请检查系统证书与文件状态')
         return json.loads(result.stdout.decode('utf-8-sig', errors='replace'))
     except (OSError, subprocess.TimeoutExpired, ValueError):
-        fail('signature_unavailable', '无法完成数字签名校验；不会使用该文件')
+        fail('signature_unavailable', '无法读取数字签名信息')
 
 
 def inspect(path, expected_sha=None, identity_checker=windows_identity):
@@ -113,24 +127,40 @@ def inspect(path, expected_sha=None, identity_checker=windows_identity):
     digest = sha256(path)
     if expected_sha and digest != expected_sha.lower():
         fail('hash_mismatch', 'SHA-256 不匹配，文件已拒绝')
-    identity = identity_checker(path)
-    if identity.get('status') != 'Valid':
-        fail('invalid_signature', 'DLL 数字签名无效或无法验证，文件已拒绝')
-    if not re.search(r'(?:^|,\s*)(?:CN|O)=NVIDIA Corporation(?:,|$)', identity.get('signer') or '', re.I):
-        fail('wrong_publisher', '签名发布者不是 NVIDIA Corporation')
-    if 'NVIDIA DLSSNR' not in (identity.get('product') or ''):
-        fail('wrong_product', '文件不是 NVIDIA DLSSNR；普通 DLSS DLL 不能代替它')
+    try:
+        identity = identity_checker(path)
+    except RuntimeErrorDetail as error:
+        if error.code != 'signature_unavailable':
+            raise
+        # User-selected builds remain usable when Windows cannot identify them.
+        identity = {'status': 'Unavailable'}
+    if not isinstance(identity, dict):
+        identity = {'status': 'Unavailable'}
+    community = COMMUNITY_VERSIONS.get(digest)
+    product = identity.get('product') or ''
     numbers = re.findall(r'\d+', identity.get('version') or '')
-    if len(numbers) != 4 or not any(int(v) for v in numbers):
-        fail('unknown_version', '无法识别 DLSSNR 的四段版本号')
+    version_parts = tuple(int(v) for v in numbers) if len(numbers) == 4 and any(int(v) for v in numbers) else None
+    version = '.'.join(map(str, version_parts)) if version_parts else 'unknown'
+    pinned = bool(community and path.stat().st_size == community['bytes'] and
+                  version in ('unknown', community['version']))
+    nvidia = bool(identity.get('status') == 'Valid' and 'NVIDIA DLSSNR' in product and version_parts and
+        re.search(r'(?:^|,\s*)(?:CN|O)=NVIDIA Corporation(?:,|$)', identity.get('signer') or '', re.I))
+    trust = 'pinned_community' if pinned else 'nvidia_signature' if nvidia else 'unrecognized'
+    if pinned and version == 'unknown':
+        version = community['version']
     # Ensure inspection and the returned hash describe the same bytes.
     if sha256(path) != digest:
         fail('file_changed', '校验过程中 DLL 被修改，请重试')
     return {'id': digest, 'sha256': digest, 'bytes': path.stat().st_size,
-            'compatibility': 'known' if digest in KNOWN_VERSIONS else 'uncharacterized',
-            'version': '.'.join(str(int(v)) for v in numbers),
-            'publisher': 'NVIDIA Corporation', 'signature': 'Valid',
-            'certificate': identity.get('thumbprint'), 'product': identity['product']}
+            'compatibility': 'known' if nvidia and not pinned and digest in KNOWN_VERSIONS else 'uncharacterized',
+            'version': version,
+            'publisher': community['publisher'] if pinned else 'NVIDIA Corporation' if nvidia else identity.get('signer') or 'unknown',
+            'signature': identity.get('status') or 'Unavailable',
+            'trust': trust,
+            'model_presets': [1, 2] if digest in MODEL_AB_HASHES or
+                version_parts and version_parts >= (310, 9, 16, 0) else [1],
+            'certificate': None if pinned else identity.get('thumbprint'),
+            'product': product}
 
 
 def parsed_url(url):
@@ -462,8 +492,6 @@ class RuntimeManager:
             self.progress('verifying')
             record = inspect(temp, expected_sha or None, self.identity_checker)
             self.progress('verifying')
-            if activate and record['compatibility'] != 'known':
-                fail('uncharacterized_version', '该版本尚未验收，请在运行库管理器中明确选择实验性使用')
             destination = self.path(record['id'])
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists():
@@ -499,13 +527,13 @@ class RuntimeManager:
                 self.operation_lock.release()
 
     def activate(self, version, allow_unrecognized=False):
+        # Keep the old argument for API compatibility. Only file structure and
+        # integrity block selection; an unrecognized identity is informational.
         if not self.operation_lock.acquire(blocking=False):
             fail('operation_busy', '运行库操作进行中')
         try:
             if version is not None:
-                _, actual = self.verified_path(version)
-                if actual['compatibility'] != 'known' and not allow_unrecognized:
-                    fail('uncharacterized_version', '该签名版本尚未验收，请明确确认实验性使用')
+                self.verified_path(version)
             with self.lock:
                 data = self.load()
                 if version is not None and not any(v.get('id') == version for v in data['versions']):

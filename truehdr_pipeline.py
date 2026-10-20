@@ -156,6 +156,7 @@ class Tail:
         self.effect = self.resize = self.bridge = self.encoder = self.encode_exchange = None
         self.lib = None
         self.ordered = ordered
+        self.prores_output = False
 
     def update(self, settings):
         if self.effect:
@@ -189,6 +190,10 @@ class Tail:
                 self.resize = Resize(self.live.d3d12_device(),frame.cuda_context,size,target,
                                      chain.export_scale_algorithm,wide=True)
             output = self.resize.texture(output)
+        output['output_hdr'] = True
+        if getattr(chain, 'prores_output', None) is not None:
+            self.prores_output = True
+            return chain.prores_output.encode(output, frame, pts)
         if self.bridge is None:
             self.bridge = GpuHdrBridge(d3d12_device=self.live.d3d12_device(),cuda_context=frame.cuda_context,
                 full_width=target[0],full_height=target[1],working_width=target[0],working_height=target[1],paper_white_scrgb=1.,purpose='encode')
@@ -248,8 +253,10 @@ class Tail:
             if not self.lib.nvenc_hdr_get_counters(self.encoder,C.byref(counts)):
                 counters = _fields(counts)
         return dict(effect=self.effect.report() if self.effect else None,encoder_contract=contract,encoder_counters=counters,
-                    output_contract=f"{contract['codec']} / {contract['profile_name']} / P010 / BT.2020 / PQ / limited range" if contract else 'P010 / BT.2020 / PQ / limited range',
-                    static_metadata='Source mastering/CLL are not reused after TrueHDR; no unmeasured output metadata invented')
+                    output_contract=('ProRes 422 HQ / yuv422p10le / BT.2020 / PQ / limited range' if self.prores_output else
+                        (f"{contract['codec']} / {contract['profile_name']} / P010 / BT.2020 / PQ / limited range" if contract else 'P010 / BT.2020 / PQ / limited range')),
+                    static_metadata=('not authored by the ProRes software encoder' if self.prores_output else
+                        'Source mastering/CLL are not reused after TrueHDR; no unmeasured output metadata invented'))
 
     def close(self):
         if self.encoder:

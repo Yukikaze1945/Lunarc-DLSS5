@@ -1,5 +1,5 @@
 import type { DLSSSettings } from "../types"
-import { DEFAULT_POST, DEFAULT_TEMPORAL } from "./qualityControls.ts"
+import { DEFAULT_POST, DEFAULT_TEMPORAL, hasExportControls } from "./qualityControls.ts"
 import { chooseReconstructionMode } from './multiScaleSettings.ts'
 import { configuredRenderStages, renderStages } from './renderPipeline.ts'
 export const DEFAULT_SETTINGS: DLSSSettings = {
@@ -26,7 +26,7 @@ export const DEFAULT_SETTINGS: DLSSSettings = {
   residual_strength: 1.0,
   flow_engine: 'nvof',
   flow_quality: '1F',
-  export_backend: 'auto',
+  export_backend: 'gpu_transfer',
   reconstruction_mode: 'single',
   layer_scales: [1.0],
   layer_weights: [1.0],
@@ -54,6 +54,11 @@ export function completeSettings(raw: Partial<DLSSSettings>): DLSSSettings {
     style: raw.style === 3 ? DEFAULT_SETTINGS.style : (raw.style ?? DEFAULT_SETTINGS.style),
     post_controls: {...DEFAULT_POST, ...raw.post_controls},
     temporal_controls: {...DEFAULT_TEMPORAL, ...raw.temporal_controls}}
+  // Migrate the old automatic backend only for saved settings that use export
+  // controls. Explicit legacy backend choices remain the user's choice.
+  if (raw.export_backend === 'auto' && hasExportControls(settings)) {
+    settings.export_backend = 'gpu_transfer'
+  }
   if (raw.render_pipeline || raw.truehdr_enabled) {
     settings.render_pipeline = configuredRenderStages(settings)
     settings.truehdr_enabled = renderStages(settings).includes('truehdr')

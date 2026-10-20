@@ -4,12 +4,14 @@ import type { CSSProperties } from 'react'
 import type { DLSSSettings } from '../types'
 import { layerNRSettings, type LayerNRKey } from '../services/multiScaleSettings'
 import { ParameterHelp } from './ParameterHelp'
+import {NRModelSelect} from './NRModelSelect'
 
-export function LayerNRControls({settings, index, onChange}: {
-  settings: DLSSSettings; index: number; onChange: (key: LayerNRKey, value: number) => void
+export function LayerNRControls({settings, index, onChange, modelPresets=[1]}: {
+  settings: DLSSSettings; index: number; modelPresets?:number[]; onChange: (key: LayerNRKey, value: number) => void
 }) {
   const values = layerNRSettings(settings, index)
   return <div className="nr-layer-controls" aria-label={ui(`第 ${index+1} 层参数`)}>
+    {index>0&&<NRModelSelect value={values.preset} available={modelPresets} label={`第 ${index+1} 层 NR 模型`} onChange={value=>onChange('preset',value)}/>}
     <div className="style-switch" role="group" aria-label={ui(`第 ${index+1} 层画面风格`)}>
       {ui([{value:0,label:'默认'},{value:2,label:'电影'},{value:1,label:'自然'}].map(item =>
         <button type="button" key={item.value} aria-pressed={values.style===item.value}

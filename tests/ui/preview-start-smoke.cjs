@@ -13,6 +13,7 @@ async function run(){
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve))
   const browser=await chromium.launch({headless:true})
   const commands=[],native=[],calls=[],segments=[],errors=[],sources=[],imageRenders=[],imagePairs=[]
+  const imageExports=[];let activeSaves=0,maxActiveSaves=0
   let imageCache=[],imageError='',frameDelay=0,queueSocket
   let suspended=true,video={path:'D:\\mock-a.mkv',filename:'mock-a.mkv',width:1920,height:1080,
     fps:24,frames:240,duration_seconds:10,pix_fmt:'yuv420p',bit_depth:8,is_hdr:false,media_type:'video'}
@@ -73,13 +74,19 @@ async function run(){
       else if(url.pathname==='/api/image/render'){
         if(imageError){await route.fulfill({status:500,contentType:'application/json',headers:{'Access-Control-Allow-Origin':'*'},body:JSON.stringify({detail:imageError})});return}
         imageRenders.push(req.postDataJSON())
-        const entry={id:'image-'+imageRenders.length,path:video.path,filename:video.filename,
+        const entry={id:'image-'+imageRenders.length,path:video.path,filename:video.filename,frame_index:req.postDataJSON().frame_index,
           width:257,height:145,hdr:false,created_at:Date.now(),host_bytes:300000,
           diagnostics:{image_memory_mode:'memory',layer_count:1,output_hdr:false,render_pipeline:['nr']}}
         imageCache=[entry,...imageCache].slice(0,2)
         result={result:entry,current:true,previous:imageCache[1]||null}
-      }else if(url.pathname==='/api/image/results')result={available:imageCache.length>0,current:true,
-        source_unchanged:true,result:imageCache[0],previous:imageCache[1],results:imageCache}
+      }else if(url.pathname==='/api/image/results'){
+        const eligible=imageCache.filter(item=>item.path===url.searchParams.get('path')&&(!url.searchParams.has('frame_index')||item.frame_index===Number(url.searchParams.get('frame_index'))))
+        result={available:eligible.length>0,current:true,source_unchanged:true,result:eligible[0],previous:eligible[1],results:imageCache}
+      }else if(url.pathname==='/api/image/export'){
+        const body=req.postDataJSON();imageExports.push(body);activeSaves++;maxActiveSaves=Math.max(maxActiveSaves,activeSaves)
+        await new Promise(resolve=>setTimeout(resolve,60));activeSaves--
+        result={image:{path:body.output_path,rendered_result_id:imageCache[0]?.id}}
+      }
       await route.fulfill({status:200,contentType:'application/json',headers:{'Access-Control-Allow-Origin':'*'},body:JSON.stringify(result)})
     })
     const renders=()=>commands.filter(c=>['seek','play','refresh','set_view'].includes(c.action))
@@ -124,6 +131,27 @@ async function run(){
     await page.getByRole('button',{name:'前进一帧',exact:true}).click()
     await page.waitForTimeout(100)
     assert.equal(renders().length,stoppedCount,'stopped preview must not restart from effects')
+    await page.locator('.qi-advanced > summary').click()
+    assert.equal(await page.getByRole('tab',{name:'时域',exact:true}).count(),1)
+    await page.getByRole('tab',{name:'HDR',exact:true}).click()
+    await page.getByRole('heading',{name:'HDR / scRGB',exact:true}).waitFor()
+    await page.getByRole('tab',{name:'基础',exact:true}).click()
+    assert.equal(await page.locator('.qi-advanced').getByText('运行库',{exact:true}).count(),0)
+    assert.equal(await page.getByRole('combobox',{name:'画面风格',exact:true}).count(),0)
+    await page.locator('.qi-advanced > summary').click()
+    await page.getByRole('combobox',{name:'渲染方式',exact:true}).selectOption('single')
+    await page.getByRole('button',{name:'渲染一帧',exact:true}).click()
+    await until(()=>imageRenders.length===1)
+    assert.equal(imageRenders[0].frame_index,2,'video single-shot must use the current frame')
+    await page.getByRole('button',{name:'导出当前帧',exact:true}).click()
+    await page.getByRole('heading',{name:'单帧导出',exact:true}).waitFor()
+    await page.getByRole('button',{name:'保存图片',exact:true}).click()
+    await page.getByText('已保存',{exact:true}).waitFor()
+    assert.ok(calls.includes('/api/image/export'))
+    assert.equal(imageRenders.length,1,'cached export must not re-render')
+    assert.equal(renders().length,stoppedCount,'single-shot mode must not start live WS inference')
+    await page.getByRole('button',{name:'重建工作台',exact:true}).click()
+    imageRenders.length=0;imagePairs.length=0;imageCache=[]
     await page.getByRole('combobox',{name:'渲染方式',exact:true}).selectOption('prerender')
     await page.getByRole('combobox',{name:'预渲染长度',exact:true}).selectOption('f5')
     fs.mkdirSync(path.resolve(__dirname,'../../build'),{recursive:true})
@@ -154,6 +182,13 @@ async function run(){
     const renderOne=page.getByRole('button',{name:'渲染一帧',exact:true})
     await renderOne.waitFor()
     assert.equal(imageRenders.length,0,'image import must not render')
+    await page.locator('.qi-advanced > summary').click()
+    assert.equal(await page.getByRole('tab',{name:'时域',exact:true}).count(),0)
+    assert.equal(await page.getByRole('tab',{name:'HDR',exact:true}).count(),0)
+    assert.equal(await page.getByRole('heading',{name:'引导与光流',exact:true}).count(),0)
+    assert.equal(await page.getByRole('heading',{name:'导出后端',exact:true}).count(),0)
+    await page.locator('.qi-advanced > summary').click()
+
     assert.equal(await page.getByRole('combobox',{name:'图片渲染模式',exact:true}).inputValue(),'memory')
     assert.equal(await page.getByRole('checkbox',{name:'实时渲染',exact:true}).isChecked(),false)
     const videoCount=renders().length
@@ -183,6 +218,25 @@ async function run(){
     await formatGroup.getByRole('button',{name:'JXL',exact:true}).waitFor()
     assert.ok(await formatGroup.getByRole('button',{name:'JXL',exact:true}).isEnabled())
     assert.ok(await formatGroup.getByRole('button',{name:'UHDR JPEG',exact:true}).isDisabled())
+    const exportStart=imageExports.length
+    await formatGroup.getByRole('button',{name:'JPEG',exact:true}).click()
+    await formatGroup.getByRole('button',{name:'WEBP',exact:true}).click({modifiers:['Control']})
+    await formatGroup.getByRole('button',{name:'PNG',exact:true}).click({modifiers:['Control']})
+    const renderCount=imageRenders.length
+    await page.getByRole('button',{name:'保存图片',exact:true}).click()
+    await page.getByText('已保存',{exact:true}).waitFor()
+    assert.deepEqual(imageExports.slice(exportStart).map(item=>item.format),['jpeg','webp','png'])
+    assert.equal(maxActiveSaves,1,'formats must be saved sequentially')
+    assert.equal(imageRenders.length,renderCount,'multiple formats share the rendered result')
+    await page.getByRole('combobox',{name:'图片导出来源',exact:true}).selectOption('rerender')
+    await formatGroup.getByRole('button',{name:'JPEG',exact:true}).click()
+    await formatGroup.getByRole('button',{name:'WEBP',exact:true}).click({modifiers:['Control']})
+    const rerenderStart=imageExports.length
+    await page.getByRole('button',{name:'保存图片',exact:true}).click()
+    await page.getByText('已保存',{exact:true}).waitFor()
+    assert.deepEqual(imageExports.slice(rerenderStart).map(item=>item.render_source),['rerender','preview'])
+    assert.equal(imageExports[rerenderStart+1].result_id,imageCache[0].id)
+    await page.getByRole('combobox',{name:'图片导出来源',exact:true}).selectOption('preview')
     imageCache[0].hdr=true
     await page.evaluate(()=>window.dispatchEvent(new Event('lunarc:image-rendered')))
     const hdrButton=page.getByRole('button',{name:'HDR',exact:true})
@@ -208,7 +262,7 @@ async function run(){
     await page.evaluate(()=>window.__backendRecovery({phase:'blocked',message:'恢复失败'}))
     await page.locator('.rail-mark[data-state=error]').waitFor()
     assert.deepEqual(errors,[])
-    console.log('PASS: preview gates, previous cache, UHDR HDR-only/.jpg/no-alpha, JXL HDR16/.jxl/alpha controls')
+    console.log('PASS: media-specific Advanced, video single-frame render/export, Ctrl format order and serial cache reuse, preview gates and HDR image controls')
   }finally{await browser.close()}
 }
 run().catch(error=>{console.error(error);process.exitCode=1}).finally(()=>server.close())

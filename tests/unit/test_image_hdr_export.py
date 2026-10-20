@@ -84,6 +84,22 @@ def test_hdr_requires_enabled_truehdr_before_encoder_queries(monkeypatch):
             render_stage_enabled={'truehdr': False}), 'avif', 'unused.png', True)
 
 
+def test_hdr_heif_alias_routes_through_heic_encoder(tmp_path,monkeypatch):
+    source=tmp_path/'source.png';source.write_bytes(b'input')
+    output=tmp_path/'result.heif'
+    monkeypatch.setattr('image_source.validate_destination',lambda *args,**kwargs:None)
+    calls=[]
+    def save_heic(path,pq,alpha,quality):
+        calls.append((pq.shape,alpha,quality))
+        open(path,'wb').write(b'encoded')
+    monkeypatch.setattr(hdr,'_save_heic',save_heic)
+    result=hdr.save_hdr_image(str(source),np.ones((2,3,3),np.float32),str(output),
+        'heif',quality=91,preserve_alpha=False)
+    assert output.read_bytes()==b'encoded'
+    assert calls==[((2,3,3),None,91)]
+    assert result['format']=='heif' and result['color_mode']=='hdr10'
+
+
 def test_fp16_image_export_never_populates_sdr_display_cache(monkeypatch):
     from gpu_preview_engine import GpuPreview
     import image_render

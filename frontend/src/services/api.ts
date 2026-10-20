@@ -64,6 +64,8 @@ export interface DlssnrVersion {
   id: string; version: string; sha256: string; signature: string; bytes: number
   path?: string; origin?: {kind: string; label?: string}
   compatibility: 'known' | 'uncharacterized'
+  trust?: 'nvidia_signature' | 'pinned_community' | 'unrecognized'
+  model_presets?: number[]
 }
 export interface DlssnrSource {
   id: string; kind: 'directory' | 'download'; label: string; location: string; sha256: string
@@ -81,6 +83,7 @@ export async function runtimeRequest<T>(path = '', method = 'GET', body?: unknow
   })
   const data = await response.json()
   if (!response.ok) throw new Error(data.detail?.message || data.detail || '运行库操作失败')
+  if (method !== 'GET') window.dispatchEvent(new Event('lunarc:runtime-changed'))
   return data as T
 }
 
@@ -140,7 +143,7 @@ export async function loadVideoFile(path: string): Promise<VideoInfo> {
   return data.video
 }
 
-export async function exportImage(request: {path:string;output_path:string;format:string;quality:number;preserve_alpha:boolean;overwrite:boolean;color_mode?:'sdr'|'hdr10';render_source?:'preview'|'rerender';result_id?:string;allow_stale?:boolean}, settings:DLSSSettings): Promise<any> {
+export async function exportImage(request: {path:string;output_path:string;format:string;quality:number;preserve_alpha:boolean;overwrite:boolean;color_mode?:'sdr'|'hdr10';render_source?:'preview'|'rerender';result_id?:string;allow_stale?:boolean;frame_index?:number}, settings:DLSSSettings): Promise<any> {
   if(request.render_source==='preview')await waitForSettings()
   else await saveSettings(settings)
   const res=await fetch(`${API_BASE}/api/image/export`,{method:'POST',headers:authHeaders({'Content-Type':'application/json'}),body:JSON.stringify(request)})
@@ -151,22 +154,23 @@ export async function exportImage(request: {path:string;output_path:string;forma
 
 export interface ImageRenderResult {
   id:string;path:string;filename:string;width:number;height:number;hdr:boolean;created_at:number;
-  host_bytes:number;diagnostics:any
+  host_bytes:number;diagnostics:any;frame_index?:number
 }
 export interface ImageResultState {
   available:boolean;current?:boolean;source_unchanged?:boolean;result?:ImageRenderResult;
   previous?:ImageRenderResult|null;results:ImageRenderResult[]
 }
-export async function imageResults(path:string):Promise<ImageResultState> {
-  const response=await fetch(`${API_BASE}/api/image/results?${new URLSearchParams({path})}`,{headers:authHeaders()})
+export async function imageResults(path:string,frame_index?:number):Promise<ImageResultState> {
+  const params=new URLSearchParams({path});if(frame_index!==undefined)params.set('frame_index',String(frame_index))
+  const response=await fetch(`${API_BASE}/api/image/results?${params}`,{headers:authHeaders()})
   const data=await response.json()
   if(!response.ok)throw new Error(data.detail||'无法读取图片结果缓存')
   return data
 }
-export async function renderImage(path:string,memory_mode:'memory'|'fast'):
+export async function renderImage(path:string,memory_mode:'memory'|'fast',frame_index?:number):
     Promise<{discarded?:boolean;result:ImageRenderResult;current:boolean;previous?:ImageRenderResult|null}> {
   const response=await fetch(`${API_BASE}/api/image/render`,{method:'POST',headers:authHeaders({'Content-Type':'application/json'}),
-    body:JSON.stringify({path,memory_mode,native:false})})
+    body:JSON.stringify({path,memory_mode,native:false,frame_index})})
   const data=await response.json()
   if(!response.ok)throw new Error(data.detail||'图片渲染失败')
   return data

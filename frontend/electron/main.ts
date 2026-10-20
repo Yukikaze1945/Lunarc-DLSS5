@@ -9,7 +9,8 @@ import {isLanguagePreference, resolveLocale, translateText, type LanguagePrefere
 import {runtimeCandidates, runtimeDirectory, runtimeFingerprint, runtimeEnvironment, probeRuntime, type BackendStartup} from './backendRuntime'
 import {AppUpdates} from './appUpdates'
 import {ComponentManager} from './componentManager'
-import {BackendRecovery, mayRestartBackend, type BackendHealth} from './backendRecovery'
+import {BackendRecovery, BackendLiveness, mayRestartBackend, type BackendHealth} from './backendRecovery'
+import {resolveAppProtocolPath} from './appProtocolPath'
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -93,6 +94,7 @@ let pyProc: ChildProcess | null = null
 let backendStartup: BackendStartup = {state: 'checking', message: '正在检查运行环境'}
 const backendPort = process.env.E2E_TEST === '1' ? Number(process.env.E2E_BACKEND_PORT || 18923) : 18923
 let shuttingDown=false, recoveryTimer:ReturnType<typeof setInterval>|null=null, healthBusy=false, blockedIncident=''
+const backendLiveness=new BackendLiveness()
 const recovery=new BackendRecovery(async()=>{
   await stopOwnedBackend()
   if(shuttingDown)throw new Error('工作台正在关闭')
@@ -133,13 +135,17 @@ function startRecoveryMonitor(){
     healthBusy=true
     try{
       const health=await readBackendHealth()
+      backendLiveness.observe(health,pyProc?.pid||null)
       if(!health.healthy&&health.incident_id&&health.queue_storage_error&&health.pid===pyProc?.pid&&blockedIncident!==health.incident_id){
         blockedIncident=health.incident_id
         win?.webContents.send('backend-recovery',{phase:'blocked',message:`队列存档失败，已停止自动重启：${health.queue_storage_error}`})
       }
       if(mayRestartBackend(health,pyProc?.pid||null))
         await recovery.recover(health.incident_id!,health.reason||'GPU 处理失败')
-    }catch{/* A brief HTTP failure alone does not prove native corruption. */}
+    }catch{
+      const stalled=backendLiveness.unresponsive(pyProc?.pid||null)
+      if(stalled)await recovery.recover(stalled.incident,stalled.reason)
+    }
     finally{healthBusy=false}
   },2000)
 }
@@ -388,9 +394,9 @@ ipcMain.handle('dialog:openFile', async () => {
     title: nativeText('选择导入素材 (视频 / 图像)'),
     properties: ['openFile'],
     filters: [
-      { name: nativeText('Media Files'), extensions: ['mp4', 'mkv', 'mov', 'avi', 'wmv', 'flv', 'webm', 'm4v', 'mpg', 'mpeg', 'ts', 'mts', 'm2ts', 'png', 'jpg', 'jpeg', 'bmp', 'webp', 'tif', 'tiff', 'avif', 'heic', 'heif', 'jxl'] },
+      { name: nativeText('Media Files'), extensions: ['mp4', 'mkv', 'mov', 'avi', 'wmv', 'flv', 'webm', 'm4v', 'mpg', 'mpeg', 'ts', 'mts', 'm2ts', 'png', 'jpg', 'jpeg', 'bmp', 'webp', 'tif', 'tiff', 'avif', 'heic', 'heif', 'jxl', 'jxr', 'wdp', 'hdp'] },
       { name: nativeText('Video Files'), extensions: ['mp4', 'mkv', 'mov', 'avi', 'wmv', 'flv', 'webm', 'm4v', 'mpg', 'mpeg', 'ts', 'mts', 'm2ts'] },
-      { name: nativeText('Images'), extensions: ['png', 'jpg', 'jpeg', 'bmp', 'webp', 'tif', 'tiff', 'avif', 'heic', 'heif', 'jxl'] },
+      { name: nativeText('Images'), extensions: ['png', 'jpg', 'jpeg', 'bmp', 'webp', 'tif', 'tiff', 'avif', 'heic', 'heif', 'jxl', 'jxr', 'wdp', 'hdp'] },
       { name: nativeText('All Files'), extensions: ['*'] },
     ],
   })
@@ -492,12 +498,8 @@ app.on('activate', () => {
 
 app.whenReady().then(async () => {
   protocol.handle('app', (request) => {
-    const url = new URL(request.url)
-    let relativePath = decodeURIComponent(url.pathname)
-    if (relativePath === '/' || !relativePath) {
-      relativePath = '/index.html'
-    }
-    const filePath = path.join(RENDERER_DIST, relativePath)
+    const filePath = resolveAppProtocolPath(request.url, RENDERER_DIST)
+    if (!filePath) return new Response('Not Found', {status: 404})
     return net.fetch(pathToFileURL(filePath).toString())
   })
 

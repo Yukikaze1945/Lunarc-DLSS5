@@ -113,7 +113,7 @@ def test_ws_reconnect_delete_completed_add_and_load_next_material(api, tmp_path)
         loaded = client.post('/api/video/load', json={'path': str(image)})
         assert loaded.status_code == 200
         assert loaded.json()['video']['filename'] == image.name
-        preview = client.get('/api/frame?view=orig')
+        preview = client.get('/api/source/frame', params={'path': str(image)})
         assert preview.status_code == 200
         assert cv2.imdecode(np.frombuffer(preview.content, np.uint8), cv2.IMREAD_COLOR).shape == (144, 256, 3)
 

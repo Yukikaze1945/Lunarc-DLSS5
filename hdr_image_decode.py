@@ -1,4 +1,4 @@
-"""CPU decoder for PQ-tagged AVIF images into linear Rec.709 scRGB."""
+"""CPU decoders for HDR stills into linear Rec.709 scRGB."""
 
 from __future__ import annotations
 
@@ -8,14 +8,19 @@ import subprocess
 import numpy as np
 
 import pipeline
+from jxr_image_decode import EXTENSIONS as JXR_EXTENSIONS
 
 
 _PQ_TRANSFERS = {"smpte2084", "smpte-st-2084"}
 
 
 def probe_hdr(path) -> dict | None:
-    """Return pipeline metadata for PQ AVIF inputs, otherwise ``None``."""
-    if os.path.splitext(os.fspath(path))[1].lower() != ".avif":
+    """Return pipeline metadata for supported HDR stills, otherwise ``None``."""
+    extension = os.path.splitext(os.fspath(path))[1].lower()
+    if extension in JXR_EXTENSIONS:
+        import jxr_image_decode
+        return jxr_image_decode.probe_hdr(path)
+    if extension != ".avif":
         return None
     info = pipeline.probe_pixel_info(os.fspath(path))
     if not isinstance(info, dict):
@@ -36,12 +41,15 @@ def probe_hdr(path) -> dict | None:
 
 
 def decode_hdr(path, info=None) -> np.ndarray:
-    """Decode one PQ AVIF to float16 RGBA, linear Rec.709 scRGB.
+    """Decode one supported HDR still to float16 RGBA linear Rec.709 scRGB.
 
     scRGB is normalized at 80 cd/m² per unit. Components may be negative or
     greater than one; only alpha is constrained to the coverage range [0, 1].
     """
     path = os.fspath(path)
+    if os.path.splitext(path)[1].lower() in JXR_EXTENSIONS:
+        import jxr_image_decode
+        return jxr_image_decode.decode_hdr(path, info)
     if info is None:
         info = probe_hdr(path)
     elif not isinstance(info, dict):

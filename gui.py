@@ -1590,7 +1590,7 @@ class App:
             self.logln("流式导出错误: " + str(ex))
             traceback.print_exc()
             self.set_status("流式导出出错: " + str(ex)[:80])
-            self.call_ui(lambda: messagebox.showerror("导出错误", str(ex)))
+            self.call_ui(lambda message=str(ex): messagebox.showerror("导出错误", message))
         finally:
             self.call_ui(lambda: self.pbar.config(value=0))
             with self._dlss_lock:
@@ -1627,7 +1627,7 @@ class App:
             self.logln("导出错误: " + str(ex))
             traceback.print_exc()
             self.set_status("导出出错: " + str(ex)[:80])
-            self.call_ui(lambda: messagebox.showerror("导出错误", str(ex)))
+            self.call_ui(lambda message=str(ex): messagebox.showerror("导出错误", message))
         finally:
             self.call_ui(lambda: self.pbar.config(value=0))
             self._preview_worker.resume()

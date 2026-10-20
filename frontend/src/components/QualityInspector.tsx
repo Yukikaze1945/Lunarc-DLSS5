@@ -1,11 +1,12 @@
 // localized-render-sinks
 import {ui,useLocale} from '../i18n/locale'
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import {foldSections} from './CollapsibleSection'
 import { RotateCcw, Search, SlidersHorizontal } from 'lucide-react'
 import type { DLSSSettings, PostControls, TemporalControls } from '../types'
 import { saveSettings } from '../services/api'
 import { DEFAULT_POST, DEFAULT_TEMPORAL } from '../services/qualityControls'
+import {renderStages} from '../services/renderPipeline'
 import './qualityInspector.css'
 import { ParameterHelp } from './ParameterHelp'
 
@@ -21,7 +22,6 @@ const TABS: { id: TabId; label: string }[] = [
 ]
 
 const SEARCH_ENTRIES: SearchEntry[] = [
-  { label: '画面风格', keys: 'style 风格 intensity 强度 neural 神经', tab: 'basic' },
   { label: 'NR 界面修正', keys: 'ui correction 界面 字幕 保护', tab: 'basic' },
   { label: '引导与光流', keys: 'guidance 引导 motion 运动 flow 光流 provider engine', tab: 'basic' },
   { label: '导出后端', keys: 'backend 后端 export 导出 gpu transfer legacy', tab: 'basic' },
@@ -29,8 +29,8 @@ const SEARCH_ENTRIES: SearchEntry[] = [
   { label: '图层与融合', keys: 'layer 图层 scale 尺度 weight 权重 fusion 融合', tab: 'layers' },
   { label: '强度与频率', keys: 'gain 增益 强度 lightness 亮度 chroma 色度 low 低 high 高 frequency 频率 residual 残差', tab: 'quality' },
   { label: '保护与区域', keys: 'protection 保护 hue 色相 dark 暗部 highlight 高光 compression 压缩 roi 区域 feather 羽化 bounds 边界 debug 调试', tab: 'quality' },
-  { label: '场景与稳定', keys: 'scene 场景 detection 检测 stability 稳定 temporal 时域 history 历史 weight 权重', tab: 'temporal' },
   { label: 'HDR 与纸白', keys: 'hdr 纸白 scrgb paper white', tab: 'hdr' },
+  { label: '场景与稳定', keys: 'scene 场景 detection 检测 stability 稳定 temporal 时域 history 历史 weight 权重', tab: 'temporal' },
 ]
 
 interface QualityInspectorProps {
@@ -41,6 +41,7 @@ interface QualityInspectorProps {
   basic: React.ReactNode
   layers: React.ReactNode
   hdr: React.ReactNode
+  image?: boolean
 }
 
 function Slider({ label, value, min, max, step, onChange, disabled = false, helpKey }:
@@ -56,7 +57,7 @@ function Slider({ label, value, min, max, step, onChange, disabled = false, help
 }
 
 export const QualityInspector: React.FC<QualityInspectorProps> = ({
-  settings, onSettingsChange, onStatusChange, primary, basic, layers, hdr,
+  settings, onSettingsChange, onStatusChange, primary, basic, layers, hdr, image = false,
 }) => {
   const locale = useLocale()
   const [tab, setTab] = useState<TabId>('basic')
@@ -64,13 +65,22 @@ export const QualityInspector: React.FC<QualityInspectorProps> = ({
   const post: PostControls = { ...DEFAULT_POST, ...settings.post_controls }
   const temporal: TemporalControls = { ...DEFAULT_TEMPORAL, ...settings.temporal_controls }
   const normalizedQuery = query.trim().toLowerCase()
+  const hasNR=renderStages(settings).includes('nr')
+  const availableTabs = TABS.filter(item=>
+    !(image&&(item.id==='temporal'||item.id==='hdr'||(!hasNR&&item.id==='basic'))) &&
+    !(!hasNR&&['layers','quality','temporal'].includes(item.id)))
+  const entries = SEARCH_ENTRIES.filter(entry=>availableTabs.some(item=>item.id===entry.tab) &&
+    !(image&&(entry.label==='引导与光流'||entry.label==='导出后端')))
+  useEffect(() => {
+    if (!availableTabs.some((item) => item.id === tab)) setTab(availableTabs[0]?.id||'basic')
+  }, [image, tab,hasNR])
   const matches = (label: string, key = '') => !normalizedQuery ||
     `${ui(label)} ${label} ${key}`.toLowerCase().includes(normalizedQuery)
   const searchResults = useMemo(() => {
     if (!normalizedQuery) return []
-    return SEARCH_ENTRIES.filter((entry) =>
+    return entries.filter((entry) =>
       `${ui(entry.label)} ${entry.label} ${entry.keys}`.toLowerCase().includes(normalizedQuery))
-  }, [normalizedQuery,locale])
+  }, [normalizedQuery,locale,image,hasNR])
 
   const savePost = async (next: PostControls) => {
     const patch = { post_controls: next }
@@ -103,11 +113,11 @@ export const QualityInspector: React.FC<QualityInspectorProps> = ({
     savePost({ ...post, roi_bounds: bounds })
   }
   const resetControls = async () => {
-    const patch = { post_controls: DEFAULT_POST, temporal_controls: DEFAULT_TEMPORAL }
+    const patch = image ? { post_controls: DEFAULT_POST } : { post_controls: DEFAULT_POST, temporal_controls: DEFAULT_TEMPORAL }
     onSettingsChange({ ...settings, ...patch })
     try {
       await saveSettings(patch)
-      onStatusChange?.('画质与时域控制已重置为严格中性')
+      onStatusChange?.(image ? '画质控制已重置为严格中性' : '画质与时域控制已重置为严格中性')
     } catch (error) {
       onSettingsChange(settings)
       onStatusChange?.(`重置被后端拒绝：${error instanceof Error ? error.message : String(error)}`)
@@ -117,11 +127,11 @@ export const QualityInspector: React.FC<QualityInspectorProps> = ({
   return (
     <aside className="quality-inspector" aria-label={ui("DLSS 参数检查器")}>
       <div className="qi-primary" role="group" aria-label={ui("基础控制")}>{ui(primary)}</div>
-      <details className="qi-advanced">
+      {availableTabs.length>0&&<details className="qi-advanced">
         <summary>{ui("高级")}<span className="qi-advanced-sign" aria-hidden="true">＋</span></summary>
       <header className="qi-header">
         <button className="qi-reset" type="button" onClick={resetControls}>
-          <RotateCcw size={14} aria-hidden="true" />{ui(" 重置画质/时域")}</button>
+          <RotateCcw size={14} aria-hidden="true" />{ui(image ? " 重置画质" : " 重置画质/时域")}</button>
         <label className="qi-search">
           <Search size={15} aria-hidden="true" />
           <input value={query} onChange={(event) => setQuery(event.target.value)}
@@ -139,7 +149,7 @@ export const QualityInspector: React.FC<QualityInspectorProps> = ({
           </div>
         ))}
         <div className="qi-tabs" role="tablist" aria-label={ui("参数分区")}>
-          {ui(TABS.map((item) => <button key={item.id} type="button" role="tab"
+          {ui(availableTabs.map((item) => <button key={item.id} type="button" role="tab"
             id={`qi-tab-${item.id}`} aria-controls={`qi-panel-${item.id}`}
             aria-selected={tab === item.id} onClick={() => setTab(item.id)}>
             <span>{ui(item.label)}</span>
@@ -151,7 +161,7 @@ export const QualityInspector: React.FC<QualityInspectorProps> = ({
         aria-labelledby={`qi-tab-${tab}`} key={tab}>
         {ui(tab === 'basic' && foldSections(basic))}
         {ui(tab === 'layers' && foldSections(layers))}
-        {ui(tab === 'hdr' && foldSections(hdr))}
+        {ui(tab === 'hdr' && !image && foldSections(hdr))}
         {ui(tab === 'quality' && foldSections(
           <div className="qi-section-stack">
             <div className="qi-export-note"><SlidersHorizontal size={16} />
@@ -236,7 +246,7 @@ export const QualityInspector: React.FC<QualityInspectorProps> = ({
           </div>
         ))}
       </div>
-      </details>
+      </details>}
     </aside>
   )
 }

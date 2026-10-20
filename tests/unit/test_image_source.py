@@ -82,6 +82,24 @@ def test_export_actual_image_formats_and_alpha(source,tmp_path,fmt,ext):
     assert result['bytes']>0
 
 
+def test_export_heif_when_encoder_is_available(source,tmp_path):
+    if not images.export_formats()['heif']:
+        pytest.skip('HEIF encoder is not installed')
+    path,rgba=source
+    output=str(tmp_path/'导出.heif')
+    result=images.save_image(path,rgba[:,:,:3],output,'heif',quality=100)
+    exported=images.heif_plugin().open_heif(output,convert_hdr_to_8bit=False)
+    assert exported.size==(17,13)
+    assert exported.info.get('bit_depth',8)==8
+    assert result['format']=='heif' and result['path']==output
+
+
+def test_heif_format_requires_matching_extension(source,tmp_path,monkeypatch):
+    monkeypatch.setattr(images,'heif_plugin',lambda:object())
+    with pytest.raises(ValueError,match='扩展名'):
+        images.validate_destination(source[0],str(tmp_path/'wrong.heic'),'heif',95)
+
+
 def test_export_never_overwrites_original_and_preserves_existing_target(source,tmp_path):
     path,rgba=source
     original=open(path,'rb').read()

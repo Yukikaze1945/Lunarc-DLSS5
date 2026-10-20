@@ -13,7 +13,7 @@
 
 Lunarc 使用 DLSS 5（DLSS5 / DLSSNR）神经渲染增强视频与图片，支持 DLAA、RTX VSR、NVIDIA VFG 补帧、TrueHDR SDR 转 HDR，以及独立图片放大与导出。
 
-[下载安装版](https://github.com/Yukikaze1945/Lunarc-DLSS5/releases/tag/v1.3.0) &nbsp; / &nbsp; [功能手册](docs/user-guide.md) &nbsp; / &nbsp; [官方网站](https://lunarc-workbench.defaddg-9590.chatgpt.site/) &nbsp; / &nbsp; [安装说明](docs/installing.md) &nbsp; / &nbsp; [源码运行](docs/getting-started.md)
+[下载安装版](https://github.com/Yukikaze1945/Lunarc-DLSS5/releases/tag/v1.4.0) &nbsp; / &nbsp; [功能手册](docs/user-guide.md) &nbsp; / &nbsp; [官方网站](https://lunarc-workbench.defaddg-9590.chatgpt.site/) &nbsp; / &nbsp; [安装说明](docs/installing.md) &nbsp; / &nbsp; [源码运行](docs/getting-started.md)
 
 本文介绍当前源码；安装版功能请以对应发行说明为准。
 
@@ -34,18 +34,18 @@ Lunarc 使用 DLSS 5（DLSS5 / DLSSNR）神经渲染增强视频与图片，支�
 | DLSSNR | 单层、双层和三层处理，各层参数可单独调整；支持顺序处理和实验性多尺度数据一致性融合。 |
 | DLAA / RTX VSR | DLAA 模型预设；RTX VSR 质量档位，按倍率或指定分辨率输出。 |
 | 光流 | NVIDIA NVOF、AMD FidelityFX Optical Flow 和 RAFT-Large。RAFT 分析尺寸可选长边 512、720、1080。 |
-| NVIDIA VFG | 按固定倍率或目标帧率插帧，支持镜头切换检测。仅用于导出；5×–8× 为实验性选项。 |
+| NVIDIA VFG | 按固定倍率或目标帧率插帧，支持镜头切换检测。仅用于导出；高倍率为实验性选项，最高 16×。 |
 | 色彩 | SDR 8-bit、SDR 10-bit 和 HDR10。HDR10 为实验性功能，支持保留静态 HDR 元数据。 |
 | TrueHDR | SDR 转 HDR10，可调整对比度、饱和度、中灰亮度和目标峰值，支持 AI 去色带；需要外部 NVIDIA 运行库。 |
 | 工作台 | 预设选择与保存、参数差异查看、可折叠卡片、区间导出和预渲染缓存。已完成且参数匹配的缓存区间显示绿条。 |
-| 素材与封装 | 拖入视频或图片；视频导出可保留音轨、字幕、章节、附件与元数据，具体取决于输出容器。图片支持独立处理和 PNG、JPEG、WebP、AVIF、HEIC 导出。 |
+| 素材与封装 | 拖入视频或图片；视频导出可保留音轨、字幕、章节、附件与元数据，具体取决于输出容器。图片支持独立处理和 PNG、JPEG、WebP、AVIF、HEIC/HEIF、Ultra HDR、JPEG XL 等格式导出。 |
 | 运行库管理 | 下载、导入和切换 DLSSNR 版本，检查文件摘要、数字签名和版本。 |
 
 ## 03 / 安装
 
-1. 在 [Releases](https://github.com/Yukikaze1945/Lunarc-DLSS5/releases/tag/v1.3.0) 下载并运行 `Lunarc-1.3.0-x64-Setup.exe`。
+1. 在 [Releases](https://github.com/Yukikaze1945/Lunarc-DLSS5/releases/tag/v1.4.0) 下载并运行 `Lunarc-1.4.0-x64-Setup.exe`。
 2. 首次启动按提示安装基础运行环境和视频处理组件。
-3. 在 **运行与诊断 → DLSSNR 运行库** 中下载或导入运行库，再选择“使用”。
+3. 在 **运行与诊断 → DLSSNR 运行库** 中下载或导入运行库，校验后自动选用。
 
 RAFT 光流需要另外安装 PyTorch/CUDA 和模型，可以在 **软件设置 → 组件管理** 中安装。不使用 RAFT 时无需下载这些文件。更新软件会保留已安装且版本匹配的组件。
 

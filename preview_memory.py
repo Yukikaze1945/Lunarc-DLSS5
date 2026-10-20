@@ -37,6 +37,10 @@ def pressured(report):
     return bool(cuda.get('total_bytes') and cuda.get('free_bytes',GIB)<GIB)
 
 def model_changed(previous,current):
+    from layer_settings import resolve_layer_settings
+    if any(resolve_layer_settings(previous, index).get('preset', 1) !=
+           resolve_layer_settings(current, index).get('preset', 1) for index in range(3)):
+        return True
     keys={'render_pipeline','render_stage_enabled','render_stage_options','dlaa_preset',
         'reconstruction_mode','working_scale','layer_scales','guidance_mode','dlss_dll_path'}
     return any(previous.get(key)!=current.get(key) and

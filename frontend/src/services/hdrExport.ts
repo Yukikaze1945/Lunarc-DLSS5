@@ -208,7 +208,9 @@ export function hdrSettingsBlockers(settings: DLSSSettings, video: VideoInfo | n
   if (video && (video.width % 2 || video.height % 2)) {
     reasons.push(`源尺寸 ${video.width}x${video.height} 必须两者皆为偶数（全幅 4:2:0）`)
   }
-  if (video?.pix_fmt && video.pix_fmt !== HDR_SOURCE_PIX_FMT) {
+  const proresSource = (video as (VideoInfo & {codec_name?: string}) | null)?.codec_name === 'prores' &&
+    video?.pix_fmt === 'yuv422p10le' && Number(video.bit_depth || 0) >= 10
+  if (video?.pix_fmt && video.pix_fmt !== HDR_SOURCE_PIX_FMT && !proresSource) {
     reasons.push(`pix_fmt=${video.pix_fmt}：HDR 链路需要 10-bit 4:2:0 源（${HDR_SOURCE_PIX_FMT}）`)
   }
   if (video && typeof video.bit_depth === 'number' && video.bit_depth < 10) {
@@ -233,6 +235,20 @@ export function hdrBlockers({
 }: HdrFormInput): string[] {
   const reasons = hdrSettingsBlockers(settings, video)
   if (!isHdrRequested(settings as unknown as Record<string, unknown>)) return reasons
+
+  if (named(ts && ts.codec, '') === 'prores_ks') {
+    const outputContainer = outPath ? outExtension(outPath) : named(ts && ts.container, '').toLowerCase()
+    if (outputContainer !== '.mov') {
+      reasons.push('ProRes 422 HQ 仅写入 MOV 容器（.mov）')
+    }
+    if (named(ts && ts.profile, '').toLowerCase() !== 'hq') {
+      reasons.push('ProRes 输出固定使用 HQ profile（profile 3）')
+    }
+    if (named(ts && ts.pixel_format, '').toLowerCase() !== 'yuv422p10le') {
+      reasons.push('ProRes 422 HQ 固定使用 yuv422p10le（10-bit 4:2:2）')
+    }
+    return reasons
+  }
 
   const codec = named(ts && ts.codec, HDR_CODEC)
   if (!P010_CODECS.includes(codec)) {

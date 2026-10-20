@@ -757,7 +757,8 @@ class GpuHdrBridge:
 
     def __init__(self, *, d3d12_device, cuda_context, full_width, full_height,
                  working_width, working_height, paper_white_scrgb, library=None, purpose="full"):
-        purposes = {"full": 0, "guidance": 1, "decode": 2, "encode": 3}
+        purposes = {"full": 0, "guidance": 1, "decode": 2, "encode": 3,
+                    "decode422": 4, "encode422": 5}
         if purpose not in purposes:
             raise HdrBridgeError(f"unknown HDR bridge purpose {purpose!r}")
         self.purpose = purpose
@@ -1055,17 +1056,20 @@ class GpuHdrBridge:
                                         ctypes.byref(uv_pitch))
         if code:
             raise self._fail("gpu_hdr_encode", code)
-        y = DevicePlane(fmt=FORMAT_P010_CUDA, pixel_format="P010LE luma",
+        is_p210 = self.purpose == "encode422"
+        y = DevicePlane(fmt=FORMAT_P010_CUDA, pixel_format=("P210LE" if is_p210 else "P010LE") + " luma",
                         width=self._full[0], height=self._full[1],
                         cuda_context=self._cuda_context, device_ptr=y_ptr.value,
                         pitch_bytes=y_pitch.value, bytes_per_pixel=2,
                         plane=PLANE_ENCODED_Y)
-        # P010 chroma is semi-planar: one interleaved Cb,Cr pair of 10-bit codes
-        # per luma 2x2 cell, so a row of full_width/2 entries carries 2 bytes per
-        # component and the same 2*full_width bytes per row as the luma plane.
+        # Both formats store one interleaved Cb,Cr 10-bit pair per two pixels.
+        # P210 retains one pair on every row; P010 has one per 2x2 cell.
         uv = DevicePlane(fmt=FORMAT_P010_CUDA,
-                         pixel_format="P010LE chroma pairs (Cb/Cr interleaved, 4:2:0)",
-                         width=self._full[0] // 2, height=self._full[1] // 2,
+                         pixel_format=("P210LE" if is_p210 else "P010LE") +
+                            (" chroma pairs (Cb/Cr interleaved, 4:2:2)" if is_p210 else
+                             " chroma pairs (Cb/Cr interleaved, 4:2:0)"),
+                         width=self._full[0] // 2,
+                         height=self._full[1] if is_p210 else self._full[1] // 2,
                          cuda_context=self._cuda_context,
                          device_ptr=uv_ptr.value, pitch_bytes=uv_pitch.value,
                          bytes_per_pixel=4, plane=PLANE_ENCODED_UV)

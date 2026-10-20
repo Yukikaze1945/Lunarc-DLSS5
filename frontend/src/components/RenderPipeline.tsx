@@ -6,6 +6,7 @@ import type { DLSSSettings, RenderStage } from '../types'
 import { moveStage, pipelinePatch, configuredRenderStages, toggleStagePatch, stageKind, stageName, stageSettings } from '../services/renderPipeline'
 import './renderPipeline.css'
 import { ParameterHelp } from './ParameterHelp'
+import {NRModelSelect} from './NRModelSelect'
 import { useStageSort } from './useStageSort'
 import { ImageModelTile } from './ImageModelTile'
 import { TrueHDRTile } from './TrueHDRTile'
@@ -42,10 +43,10 @@ function VsrScale({ value, onChange }: { value: number; onChange: (value: number
   </>
 }
 
-export function RenderPipeline({ settings, onChange, image=false }: {
-  settings: DLSSSettings; image?:boolean; onChange: (patch: Partial<DLSSSettings>) => void
+export function RenderPipeline({ settings, onChange, image=false, nrModelPresets=[1] }: {
+  settings: DLSSSettings; image?:boolean; nrModelPresets?:number[]; onChange: (patch: Partial<DLSSSettings>) => void
 }) {
-  const stages = configuredRenderStages(settings)
+  const stages = configuredRenderStages(settings).filter(stage=>!image||stageKind(stage)!=='vfg')
   const vfgMode = settings.frame_generation === 'vfg_dynamic' || (settings.frame_generation === 'off' && settings.frame_generation_saved_mode === 'vfg_dynamic') ? 'vfg_dynamic' : 'vfg'
   const [open,setOpen]=useState(true)
   const [closed,setClosed]=useState<Partial<Record<RenderStage,boolean>>>({})
@@ -71,9 +72,10 @@ export function RenderPipeline({ settings, onChange, image=false }: {
         <button type="button" aria-label={ui(`${stageName(stage)} 上移`)} disabled={i === 0} onClick={() => sort.animateSave(moveStage(stages, i, i - 1))}><ArrowUp size={14}/></button>
         <button type="button" aria-label={ui(`${stageName(stage)} 下移`)} disabled={i === stages.length - 1} onClick={() => sort.animateSave(moveStage(stages, i, i + 1))}><ArrowDown size={14}/></button>
         <button type="button" aria-label={ui(`移除 ${stageName(stage)}`)} disabled={stages.length === 1} onClick={() => save(stages.filter(s => s !== stage))}><X size={14}/></button>
-        {ui(stage!=='nr'&&<button type="button" aria-label={ui(`${closed[stage]?'展开':'收起'} ${stageName(stage)} 参数`)} aria-expanded={!closed[stage]} onClick={()=>setClosed(value=>({...value,[stage]:!value[stage]}))}>{ui(closed[stage]?<Plus size={14}/>:<Minus size={14}/>)}</button>)}
+        <button type="button" aria-label={ui(`${closed[stage]?'展开':'收起'} ${stageName(stage)} 参数`)} aria-expanded={!closed[stage]} onClick={()=>setClosed(value=>({...value,[stage]:!value[stage]}))}>{ui(closed[stage]?<Plus size={14}/>:<Minus size={14}/>)}</button>
       </div>
       <fieldset className="render-stage-body" hidden={closed[stage]} disabled={settings.render_stage_enabled?.[stage] === false}>
+      {kind === 'nr' && <div className="render-stage-options render-stage-single"><NRModelSelect value={settings.preset} available={nrModelPresets} onChange={preset=>onChange({preset})}/></div>}
       {ui(stage === 'truehdr' && <TrueHDRTile settings={settings} onChange={onChange}/>)}
       {ui(stage === 'dlaa' && <div className="render-stage-options render-stage-single">
         <label>{ui("模型")}<ParameterHelp name="dlaa_preset" label="DLAA 模型预设"/><select aria-label={ui("DLAA 模型预设")} value={settings.dlaa_preset ?? 0} onChange={e => onChange({dlaa_preset:Number(e.target.value) as DLSSSettings['dlaa_preset']})}>
@@ -110,7 +112,7 @@ export function RenderPipeline({ settings, onChange, image=false }: {
       </>)}
     </div></div>)}
     </fieldset></li>}))}</ol>
-    <div className="render-add">{ui((['dlaa','nr','vsr','vfg','truehdr'] as RenderStage[]).filter(s=>s==='vsr'||!stages.includes(s)).map(stage=><button key={stage} type="button" onClick={()=>add(stage)}><Plus size={13}/>{ui(stageName(stage))}</button>))}</div>
+    <div className="render-add">{ui((['dlaa','nr','vsr','vfg','truehdr'] as RenderStage[]).filter(s=>(!image||s!=='vfg')&&(s==='vsr'||!stages.includes(s))).map(stage=><button key={stage} type="button" onClick={()=>add(stage)}><Plus size={13}/>{ui(stageName(stage))}</button>))}</div>
     {ui(image&&(['illustration','animesharp'] as RenderStage[]).some(stage=>!stages.includes(stage))&&<div className="render-image-add"><span>{ui("图片放大模型")}</span><div className="render-add" aria-label={ui("添加图片放大模型")}>{ui((['illustration','animesharp'] as RenderStage[]).filter(stage=>!stages.includes(stage)).map(stage=><button key={stage} type="button" onClick={()=>add(stage)}><Plus size={13}/>{ui(stageName(stage))}</button>))}</div></div>)}
     </div>
   </section>

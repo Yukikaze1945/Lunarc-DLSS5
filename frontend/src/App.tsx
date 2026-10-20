@@ -43,6 +43,7 @@ function WorkspaceApp() {
   useEffect(()=>{const open=(event:Event)=>{const pair=(event as CustomEvent).detail;
     if(pair?.original&&pair?.exported){setComparePair(pair);setActiveTab('compare')}};
     window.addEventListener('lunarc:compare',open);return()=>window.removeEventListener('lunarc:compare',open)},[])
+  useEffect(()=>{const open=()=>setActiveTab('image-deliver');window.addEventListener('lunarc:open-image-deliver',open);return()=>window.removeEventListener('lunarc:open-image-deliver',open)},[])
   useEffect(()=>{const open=()=>setActiveTab('deliver');window.addEventListener('lunarc:open-deliver',open);return()=>window.removeEventListener('lunarc:open-deliver',open)},[])
   const [theme,setTheme]=useState(readTheme)
   useEffect(()=>applyTheme(theme),[theme])
@@ -157,7 +158,7 @@ function WorkspaceApp() {
     <div className="app-content"><Header activeTab={activeTab} onNavigate={setActiveTab} theme={theme} onThemeChange={()=>setTheme(t=>t==='dark'?'light':'dark')} onFileLoaded={importFile} onError={message=>{setAppError(true);setStatusText(message)}} image={video?.media_type==='image'}/><main className="page-host">
       <div className={`mounted-page ${activeTab==='dlss'?'':'hidden'}`}><DLSSPage video={video} settings={settings} onSettingsChange={updateSettings} currentFrame={currentFrame} setCurrentFrame={setCurrentFrame} onStatusChange={setStatusText} onActivityChange={setPreviewActivity} isActive={ready&&activeTab==='dlss'}/></div>
       <div className={`mounted-page ${activeTab==='deliver'?'':'hidden'}`}><DeliverPage video={video?.media_type==='image'?null:video} settings={settings} onSettingsChange={updateSettings} onStatusChange={setStatusText} isActive={activeTab==='deliver'}/></div>
-      <div className={`mounted-page ${activeTab==='image-deliver'?'':'hidden'}`}>{ui(video?.media_type==='image'?<ImageDeliverPage video={video} settings={settings} onStatusChange={setStatusText}/>:<div className="workspace-page"><h1>{ui("图片导出")}</h1><p>{ui("先导入一张图片，再选择格式与保存位置。")}</p></div>)}</div>
+      <div className={`mounted-page ${activeTab==='image-deliver'?'':'hidden'}`}>{ui(video?<ImageDeliverPage isActive={activeTab==='image-deliver'} video={video} currentFrame={currentFrame} settings={settings} onStatusChange={setStatusText}/>:<div className="workspace-page"><h1>{ui("图片导出")}</h1><p>{ui("先导入图片或视频，再选择格式与保存位置。")}</p></div>)}</div>
       {ui(activeTab==='compare'&&<ComparePage initialPair={comparePair}/>)}
       {ui(activeTab==='guide'&&<Guide/>)}
       {ui(!['dlss','deliver','image-deliver','compare','guide'].includes(activeTab)&&<WorkspacePages page={activeTab} video={video} system={system} settings={settings} recent={recent} onImport={importFile} onNavigate={setActiveTab} onApply={applySettings} onStatus={setStatusText}/>)}

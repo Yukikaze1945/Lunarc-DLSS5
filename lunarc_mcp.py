@@ -165,7 +165,7 @@ def create_server(backend):
                            preserve_alpha:bool=True,overwrite:bool=False) -> dict[str,Any]:
         """Render and save one image with a preset/overrides. Returns saved file or error; GPU-busy is explicit.
 
-        format: png/jpeg/webp/avif/heic/uhdr/jxl. color_mode: sdr/hdr10. No UI parameter changes.
+        format: png/jpeg/webp/avif/heic/heif/uhdr/jxl. color_mode: sdr/hdr10. No UI parameter changes.
         """
         return await backend.request('/api/automation/image',dict(input_path=input_path,output_path=output_path,
             format=format,color_mode=color_mode,preset=preset,settings=settings or {},quality=quality,

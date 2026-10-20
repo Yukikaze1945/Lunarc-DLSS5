@@ -26,6 +26,7 @@ import {CollapsibleSection} from '../components/CollapsibleSection'
 import { renderStages, hasScaleStages, vsrOutputSize } from '../services/renderPipeline'
 import { VideoInfo, DLSSSettings } from '../types'
 import { saveSettings, wsUrl, fetchFlowProviders, fetchJobDiagnostics, previewMemory, imageThumbnail, sourceFrame,
+  runtimeRequest, type DlssnrStatus,
   renderImage,imageResults,renderedImagePreview,compareImageResults,type ImageRenderResult,type PreviewMemoryState } from '../services/api'
 import { subscribeQueue } from '../services/queue'
 import { resolveWorkingDims } from '../services/workingScale'
@@ -96,7 +97,11 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
   const [memoryPaused,setMemoryPaused]=useState(false)
   const [memoryBusy,setMemoryBusy]=useState(false)
   const memoryPausedRef=useRef(false),memoryRevision=useRef(0)
-  const renderEnabled=!!video&&renderVideo===video&&!memoryPaused&&(renderMode==='realtime'||video.media_type==='image')
+  const imageSource=video?.media_type==='image'
+  const singleFrameMode=!imageSource&&renderMode==='single'
+  const stillSource=imageSource||singleFrameMode
+  const stillSourceRef=useRef(stillSource);stillSourceRef.current=stillSource
+  const renderEnabled=!!video&&renderVideo===video&&!memoryPaused&&(renderMode!=='prerender'||imageSource)
   const renderEnabledRef=useRef(false);renderEnabledRef.current=renderEnabled
   const [isDraggingSplit, setIsDraggingSplit] = useState<boolean>(false)
   const [isPanning, setIsPanning] = useState<boolean>(false)
@@ -105,7 +110,6 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
   const canvasRef = useRef<HTMLDivElement>(null)
   const splitRef=useRef(splitX)
   const viewControls=useRef({view,zoom,pan});viewControls.current={view,zoom,pan}
-  const imageSource=video?.media_type==='image'
   // TrueHDR stills need the same FP16 presenter as video, not an 8-bit JPEG pair.
   const nativeRequired=Boolean(video&&window.electronAPI?.getPreviewWindow&&
     (!imageSource||imageResult?.hdr||(imageReference==='previous'&&previousImageResult?.hdr)||renderStages(settings).includes('truehdr')))
@@ -169,6 +173,20 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
   // Optical flow hardware probe state
   const [flowProviders, setFlowProviders] = useState<any[]>([])
   const [nvofProbe, setNvofProbe] = useState<any>(null)
+  const [nrModelPresets,setNrModelPresets]=useState<number[]>([])
+  useEffect(()=>{
+    let active=true, revision=0
+    const refresh=async()=>{
+      const current=++revision
+      try{
+        const state=await runtimeRequest<DlssnrStatus>()
+        if(active&&current===revision)setNrModelPresets(state.error?[]:state.active?.model_presets??[])
+      }catch{if(active&&current===revision)setNrModelPresets([])}
+    }
+    void refresh()
+    window.addEventListener('lunarc:runtime-changed',refresh)
+    return()=>{active=false;window.removeEventListener('lunarc:runtime-changed',refresh)}
+  },[])
   const [recentFusionJob, setRecentFusionJob] = useState<{name:string;status:string;report:any}|null>(null)
   const inspectedJobId = useRef('')
   const [selectedLayer, setSelectedLayer] = useState(0)
@@ -224,7 +242,7 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
   const displayedBlobRef = useRef('')
   const sendPlayer = useCallback((command: Record<string, unknown>) => {
     // Stills use explicit HTTP render requests. Socket/view refreshes may not infer.
-    if(video?.media_type==='image'&&command.action!=='pause')return
+    if(stillSource&&command.action!=='pause')return
     if(!renderEnabledRef.current&&command.action!=='pause')return
     if(memoryPausedRef.current&&command.action!=='pause')return
     if(!activeRef.current&&command.action!=='pause')return
@@ -248,7 +266,7 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
       return
     }
     if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(JSON.stringify(payload))
-  }, [fullImagePreview,nativePanel.ready,nativeRequired,view==='flow',video?.media_type])
+  }, [fullImagePreview,nativePanel.ready,nativeRequired,view==='flow',video?.media_type,stillSource])
 
   useEffect(() => {
     let ws: WebSocket | null = null, stopped = false, header: any = null
@@ -271,7 +289,7 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
           return
         }
         const decoded = performance.now()
-        const stale = () => stopped || !renderEnabledRef.current || memoryPausedRef.current || sequence !== latestSequence || data.request_id !== requestRevisionRef.current
+        const stale = () => stopped || stillSourceRef.current || !renderEnabledRef.current || memoryPausedRef.current || sequence !== latestSequence || data.request_id !== requestRevisionRef.current
         if (stale()) {if (jpeg) URL.revokeObjectURL(url); return}
         raf = requestAnimationFrame(() => {
           if (stale()) {if (jpeg) URL.revokeObjectURL(url); return}
@@ -302,6 +320,7 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
       }
       ws.onopen = () => {
         if(!renderEnabledRef.current)return
+        if(stillSourceRef.current)return
         if(memoryPausedRef.current)return
         if(!activeRef.current)return
         if(nativeRequiredRef.current&&!nativeReadyRef.current)return
@@ -321,6 +340,8 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
           if(data.type==='preview_memory'){
             if(data.suspended){++latestSequence;header=null}
             applyMemoryState(data)
+          } else if(stillSourceRef.current){
+            return
           } else if (data.type === 'frame') {
             if(!renderEnabledRef.current)return
             if(memoryPausedRef.current)return
@@ -424,7 +445,7 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
     const source=video,revision=++renderRevision.current
     setLaunchBusy(true);setPlayerError(null)
     try{
-      if(source.media_type==='image'){
+      if(source.media_type==='image'||renderMode==='single'){
         if(!renderEnabledRef.current){
           const state=await previewMemory('resume')
           if(revision!==renderRevision.current||sourceRef.current!==source)return
@@ -452,21 +473,22 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
   }
 
   const choosePreviewMode=(mode:PreviewMode)=>{
+    if(mode==='single'&&view==='flow')setView('split')
     setRenderMode(mode)
     if(renderVideo){void stopRendering().catch(()=>{})}
   }
 
   useEffect(()=>{
-    if(!imageSource||!video||!isActive||!renderEnabled||imageTicket<=imageCompleted.current||imageWorkBusy.current)return
+    if(!stillSource||!video||!isActive||!renderEnabled||imageTicket<=imageCompleted.current||imageWorkBusy.current)return
     if(settingsPendingRef.current&&!imageRealtime)return
     if(nativeRequired&&!nativePanel.ready)return
     const source=video,ticket=imageTicket
     imageWorkBusy.current=true;setImageBusy(true);setPreviewPending(true);setPlayerError(null)
-    void renderImage(source.path,settings.image_memory_mode||'memory').then(data=>{
+    void renderImage(source.path,settings.image_memory_mode||'memory',imageSource?undefined:currentFrameRef.current).then(data=>{
       if(sourceRef.current!==source||!renderEnabledRef.current||data.discarded)return
       setImageResult(data.result);setPreviousImageResult(data.previous||null)
       setImageResultStale(!data.current);setPreviewStats(data.result.diagnostics)
-      onStatusChange?.(data.current?'图片渲染完成':'图片已渲染，参数有新改动')
+      onStatusChange?.(data.current?(imageSource?'图片渲染完成':'单帧渲染完成'):'已渲染，参数有新改动')
       window.dispatchEvent(new CustomEvent('lunarc:image-rendered',{detail:{path:source.path,result_id:data.result.id}}))
     }).catch(error=>{
       if(sourceRef.current===source&&renderEnabledRef.current){setPlayerError(error.message);onStatusChange?.(error.message)}
@@ -475,10 +497,10 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
       imageWorkBusy.current=false;setImageBusy(false);setPreviewPending(false)
       setImageWorkEpoch(value=>value+1)
     })
-  },[video,imageSource,isActive,renderEnabled,imageTicket,imageWorkEpoch,imageRealtime,nativeRequired,nativePanel.ready,settings.image_memory_mode])
+  },[video,imageSource,stillSource,isActive,renderEnabled,imageTicket,imageWorkEpoch,imageRealtime,nativeRequired,nativePanel.ready,settings.image_memory_mode])
 
   useEffect(()=>{
-    if(!imageSource||!imageResult||!renderEnabled||!isActive||imageBusy||imageWorkBusy.current)return
+    if(!stillSource||!imageResult||!renderEnabled||!isActive||imageBusy||imageWorkBusy.current)return
     if(nativeRequired&&!nativePanel.ready)return
     let cancelled=false
     const source=video,controller=new AbortController()
@@ -499,7 +521,7 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
     void present().catch(error=>{if(!cancelled&&error.name!=='AbortError')setPlayerError(error.message)})
       .finally(()=>{if(!cancelled)setImagePresentBusy(false)})
     return()=>{cancelled=true;controller.abort();setImagePresentBusy(false)}
-  },[imageSource,imageResult,imageReference,previousImageResult,renderEnabled,isActive,imageBusy,nativeRequired,nativePanel.ready,video])
+  },[stillSource,imageResult,imageReference,previousImageResult,renderEnabled,isActive,imageBusy,nativeRequired,nativePanel.ready,video])
 
   useEffect(()=>{
     const restored=()=>{
@@ -518,23 +540,23 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
       settingsPendingRef.current = true
       settingsTimingRef.current = {inputAt:performance.now()}
       setPlayerError(null)
-      if(video?.media_type==='image')setImageResultStale(Boolean(imageResultRef.current))
-      if(renderEnabledRef.current&&!memoryPausedRef.current&&(video?.media_type!=='image'||imageRealtimeRef.current))setPreviewPending(true)
+      if(stillSource)setImageResultStale(Boolean(imageResultRef.current))
+      if(renderEnabledRef.current&&!memoryPausedRef.current&&(!stillSource||imageRealtimeRef.current))setPreviewPending(true)
     }
     const applied = (event: Event) => {
       const detail = (event as CustomEvent).detail
       settingsRevisionRef.current = detail.revision ?? settingsRevisionRef.current
       settingsTimingRef.current = detail
-      if(video?.media_type==='image'){
-        if(imageRealtimeRef.current&&renderEnabledRef.current)setImageTicket(value=>value+1)
+      if(stillSource){
+        if(imageSource&&imageRealtimeRef.current&&renderEnabledRef.current)setImageTicket(value=>value+1)
       }else if (video) sendPlayer({action:'refresh'})
     }
     const settled = () => {
       settingsPendingRef.current = false
-      if(video?.media_type==='image'){
+      if(stillSource&&video){
         setImageWorkEpoch(value=>value+1)
         const source=video,result=imageResultRef.current
-        if(result)void imageResults(source.path).then(state=>{
+        if(result)void imageResults(source.path,singleFrameMode?result.frame_index:undefined).then(state=>{
           if(sourceRef.current===source&&imageResultRef.current?.id===result.id)setImageResultStale(!state.current)
         }).catch(()=>{})
       }else if (video) sendPlayer({action:'refresh'})
@@ -547,7 +569,7 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
       window.removeEventListener('lunarc:settings-applied', applied)
       window.removeEventListener('lunarc:settings-settled', settled)
     }
-  }, [video, sendPlayer])
+  }, [video, sendPlayer,stillSource,singleFrameMode,imageSource])
 
   useEffect(() => {
     ++renderRevision.current;renderEnabledRef.current=false;setRenderVideo(null)
@@ -573,7 +595,7 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
   // The native window already holds both GPU pictures. View, wipe and pan
   // changes redraw there, without sending a new frame through the backend.
   useEffect(() => {
-    if (!video||!renderEnabled) return
+    if (!video||!renderEnabled||stillSource) return
     if(nativeRequired&&viewControls.current.view!=='flow'&&!nativePanel.ready)return
     if(pendingNativeCommand.current) {
       const command=pendingNativeCommand.current;pendingNativeCommand.current=null
@@ -593,7 +615,7 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
     } else {
       requestFrame(currentFrameRef.current)
     }
-  }, [video, isPlaying, requestFrame, renderScope, sendPlayer,renderEnabled])
+  }, [video, isPlaying, requestFrame, renderScope, sendPlayer,renderEnabled,stillSource])
 
   useEffect(()=>{
     if(!video||video.media_type==='image'||(nativeRequired&&view!=='flow'))return
@@ -604,7 +626,7 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
   // Play / Pause handling (P1-08 sends loop; P1-10 never claims playing
   // without an open socket — disconnected play becomes buffered intent)
   const togglePlay = () => {
-    if (!video || video.media_type==='image'||!renderEnabledRef.current) return
+    if (!video || stillSource||!renderEnabledRef.current) return
     const nextPlaying = !isPlaying
     wantPlayingRef.current = nextPlaying
 
@@ -673,6 +695,10 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
     const total = video?.frames || 1
     const clamped = Math.max(0, Math.min(total - 1, frame))
     setCurrentFrame(clamped)
+    if(singleFrameMode){
+      renderEnabledRef.current=false;setRenderVideo(null);setPreviewPending(false)
+      return
+    }
     if (isPlaying) {
       setIsPlaying(false)
       wantPlayingRef.current = false
@@ -871,8 +897,8 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
         <div className="dlss-view-toolbar">
           <div className="dlss-view-modes" role="group" aria-label={ui("预览视图")}>{ui(([
             {id:'split',label:'对比'},{id:'dual',label:'双画面'},{id:'dlss',label:'增强'},{id:'orig',label:'原图'},{id:'flow',label:'光流'},
-          ] as const).filter(item=>video?.media_type!=='image'||item.id!=='flow').map(item=><button key={item.id} type="button" aria-pressed={view===item.id} onClick={()=>setView(item.id)}>{ui(item.label)}</button>))}</div>
-          {imageSource&&imageResult&&<label className="image-reference-picker">{ui('对比参考')}<select aria-label={ui('图片对比参考')} value={imageReference} disabled={imageBusy} onChange={event=>setImageReference(event.target.value as 'original'|'previous')}>
+          ] as const).filter(item=>!stillSource||item.id!=='flow').map(item=><button key={item.id} type="button" aria-pressed={view===item.id} onClick={()=>setView(item.id)}>{ui(item.label)}</button>))}</div>
+          {stillSource&&imageResult&&<label className="image-reference-picker">{ui('对比参考')}<select aria-label={ui('图片对比参考')} value={imageReference} disabled={imageBusy} onChange={event=>setImageReference(event.target.value as 'original'|'previous')}>
             <option value="original">{ui('原图')}</option><option value="previous" disabled={!previousImageResult}>{ui('上一份结果')}</option>
           </select></label>}
           <div className="dlss-zoom-tools">
@@ -902,25 +928,26 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
             else imageCompleted.current=imageTicket
           }}/>{ui('实时渲染')}</label></>}
           {video?.media_type!=='image'&&<><label>{ui('渲染方式')}<select aria-label={ui('渲染方式')} value={renderMode} disabled={memoryBusy||launchBusy||prerenderBusy} onChange={event=>choosePreviewMode(event.target.value as PreviewMode)}>
-            <option value="realtime">{ui('实时渲染')}</option><option value="prerender">{ui('预渲染')}</option>
+            <option value="single">{ui('单帧渲染')}</option><option value="realtime">{ui('实时渲染')}</option><option value="prerender">{ui('预渲染')}</option>
           </select></label>{renderMode==='prerender'&&<label>{ui('预渲染长度')}<select aria-label={ui('预渲染长度')} value={previewLength} disabled={launchBusy||prerenderBusy} onChange={event=>setPreviewLength(event.target.value as PreviewLength)}>
             {PREVIEW_LENGTHS.map(option=><option key={option.id} value={option.id}>{ui(option.label)}</option>)}
           </select></label>}</>}
-          <button className="button primary" type="button" disabled={!video||memoryBusy||launchBusy||prerenderBusy||imageBusy} onClick={()=>void (imageSource?startRendering():renderEnabled?stopRendering():startRendering()).catch(()=>{})}>
-            {renderEnabled&&!imageSource?<Pause size={15}/>:<Play size={15}/>}{ui(memoryBusy||launchBusy?'处理中…':imageBusy?'正在渲染…':imageSource?'渲染一帧':prerenderBusy?'预渲染中…':renderEnabled?'停止渲染':'开启渲染')}
+          <button className="button primary" type="button" disabled={!video||memoryBusy||launchBusy||prerenderBusy||imageBusy} onClick={()=>void (stillSource?startRendering():renderEnabled?stopRendering():startRendering()).catch(()=>{})}>
+            {renderEnabled&&!stillSource?<Pause size={15}/>:<Play size={15}/>}{ui(memoryBusy||launchBusy?'处理中…':imageBusy?'正在渲染…':stillSource?'渲染一帧':prerenderBusy?'预渲染中…':renderEnabled?'停止渲染':'开启渲染')}
           </button>
+          {singleFrameMode&&imageResult&&<button className="button" type="button" disabled={imageBusy||imageResult.frame_index!==currentFrame} onClick={()=>window.dispatchEvent(new Event('lunarc:open-image-deliver'))}>{ui('导出当前帧')}</button>}
         </div>
-        {imageSource&&imageResult&&imageReference==='previous'&&previousImageResult&&<div className="image-comparison-caption">{ui('上一份结果')} · {previousImageResult.filename} · {previousImageResult.width}×{previousImageResult.height} · {previousImageResult.hdr?'HDR':'SDR'} ↔ {ui('本次结果')} · {imageResult.width}×{imageResult.height} · {imageResult.hdr?'HDR':'SDR'}</div>}
+        {stillSource&&imageResult&&imageReference==='previous'&&previousImageResult&&<div className="image-comparison-caption">{ui('上一份结果')} · {previousImageResult.filename} · {previousImageResult.width}×{previousImageResult.height} · {previousImageResult.hdr?'HDR':'SDR'} ↔ {ui('本次结果')} · {imageResult.width}×{imageResult.height} · {imageResult.hdr?'HDR':'SDR'}</div>}
         {(playerError||nativePanel.error||(!renderEnabled&&sourceError))&&<ProcessingError message={playerError||nativePanel.error||sourceError}
           onDismiss={()=>{setPlayerError(null);setSourceError('')}}/>}
         <section ref={canvasRef} className="dlss-monitor" aria-label={ui("视频预览画布")} title={ui(showNative?'上方菜单缩放；右键拖动画面':video?.media_type==='image'?'Alt＋滚轮缩放；左键拖动画面；滚轮上下移动':'实际处理层数和模式显示在画面中')} onPointerDown={handleMouseDown} onPointerMove={handleMouseMove} onPointerUp={handleMouseUp} onPointerCancel={handleMouseUp} onContextMenu={event=>event.preventDefault()}>
 
 
-          {ui(!renderEnabled?sourceUrl?<ImageViewport src={sourceUrl} zoom={zoom} onZoom={value=>{setPixelPreview(false);setZoom(value)}} pan={pan} onPan={setPan}/>:<div className="dlss-empty-preview"><strong>{ui(video?'正在读取原素材…':'导入素材，开始重建。')}</strong></div>:showNative?(sourceUrl?<ImageViewport src={sourceUrl} zoom={zoom} onZoom={value=>{setPixelPreview(false);setZoom(value)}} pan={pan} onPan={setPan}/>:<div className="dlss-empty-preview" aria-label={ui("原生 GPU 显示区域")}><strong>{ui(playerBusy||'正在准备原生预览…')}</strong></div>):video?.media_type==='image'&&activeFrameUrl?<ImageViewport src={activeFrameUrl} paired view={view} zoom={zoom} onZoom={value=>{setPixelPreview(false);setZoom(value)}} pan={pan} onPan={setPan} split={splitX} onSplit={value=>{splitRef.current=value;setSplitX(value)}}/>:activeFrameUrl?<img src={activeFrameUrl} alt={ui("当前预览帧")} className="dlss-preview-image" draggable={false}
+          {ui(!renderEnabled?sourceUrl?<ImageViewport src={sourceUrl} zoom={zoom} onZoom={value=>{setPixelPreview(false);setZoom(value)}} pan={pan} onPan={setPan}/>:<div className="dlss-empty-preview"><strong>{ui(video?'正在读取原素材…':'导入素材，开始重建。')}</strong></div>:showNative?(sourceUrl?<ImageViewport src={sourceUrl} zoom={zoom} onZoom={value=>{setPixelPreview(false);setZoom(value)}} pan={pan} onPan={setPan}/>:<div className="dlss-empty-preview" aria-label={ui("原生 GPU 显示区域")}><strong>{ui(playerBusy||'正在准备原生预览…')}</strong></div>):stillSource&&activeFrameUrl?<ImageViewport src={activeFrameUrl} paired view={view} zoom={zoom} onZoom={value=>{setPixelPreview(false);setZoom(value)}} pan={pan} onPan={setPan} split={splitX} onSplit={value=>{splitRef.current=value;setSplitX(value)}}/>:activeFrameUrl?<img src={activeFrameUrl} alt={ui("当前预览帧")} className="dlss-preview-image" draggable={false}
             onLoad={event=>{setPreviewImageSize({width:event.currentTarget.naturalWidth,height:event.currentTarget.naturalHeight})}}
             style={pixelPreview&&previewImageSize?{width:previewImageSize.width/devicePixelRatio,height:previewImageSize.height/devicePixelRatio}:undefined}/>:<div className="dlss-empty-preview"><div className="empty-glyph"><span/><span/><span/></div><strong>{ui(video?(renderEnabled?'正在准备预览…':'点击“开启渲染”后生成预览'):'导入素材，开始重建。')}</strong></div>)}
           {ui(zoom>1.01&&<div className="pan-hint"><Move size={13}/>{ui(showNative?'右键拖动画布以查看细节':video?.media_type==='image'||!renderEnabled?'左键拖动画面 · 滚轮上下移动':'右键拖动画布以查看细节')}</div>)}
-          {ui(renderEnabled&&!nativeRequired&&video?.media_type!=='image'&&view==='split'&&activeFrameUrl&&<div className="split-marker" aria-hidden="true" style={{left:`${splitX*100}%`}}/>)}
+          {ui(renderEnabled&&!nativeRequired&&!stillSource&&view==='split'&&activeFrameUrl&&<div className="split-marker" aria-hidden="true" style={{left:`${splitX*100}%`}}/>)}
           {ui(showSdrMapping&&<div className="preview-warning" title={ui(showNative?'当前显示器未启用 HDR，原生预览正在映射为 SDR。':'当前预览将 HDR 映射到 SDR 显示，不改变 HDR 导出结果。')}><AlertTriangle size={13}/>{ui("HDR → SDR 预览")}</div>)}
           {ui(showNative&&hdrDisplayExpected&&nativeHdrActive===true&&<div className="preview-warning">HDR · FP16 scRGB</div>)}
           {ui(!renderEnabled&&sourceUrl&&<div className="preview-execution">{ui('原素材 · 未开启效果渲染')}</div>)}
@@ -938,17 +965,17 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
           </div>)}
 
         </section>
-        <div className="dlss-material"><strong title={ui(video?.path)}>{video?.filename||ui('未载入素材')}</strong><span>{ui(video?`${video.width} × ${video.height} · ${video.is_hdr?'HDR10':'SDR'}`:'')}</span></div>
+        <div className="dlss-material"><strong title={ui(video?.path)}>{video?.filename||ui('未载入素材')}</strong><span>{ui(video?`${video.width} × ${video.height} · ${video.is_hdr?(video.media_type==='image'?'HDR':'HDR10'):'SDR'}`:'')}</span></div>
         {ui(video?.media_type!=='image'&&<div className="dlss-transport">
           <SegmentTimeline video={video} settings={settings} currentFrame={currentFrame} onSeek={handleSeek} onSettingsChange={handleParamsBatchChange} onStatus={onStatusChange} onBeforeRender={stopRendering} onPause={async()=>{if(!memoryPausedRef.current)await stopRendering()}} previewRequest={previewRequest} onRenderBusy={setPrerenderBusy}/>
-          <div className="transport-buttons"><button type="button" aria-label={ui("跳至首帧")} onClick={()=>handleSeek(0)}><SkipBack size={16}/></button><button type="button" aria-label={ui("后退一帧")} onClick={()=>handleSeek(currentFrame-1)}>−1</button><button type="button" className="transport-play" disabled={!renderEnabled} onClick={togglePlay} aria-label={ui(isPlaying?'暂停播放':'开始播放')}>{ui(isPlaying?<Pause size={16}/>:<Play size={16} />)}</button><button type="button" aria-label={ui("前进一帧")} onClick={()=>handleSeek(currentFrame+1)}>+1</button><button type="button" aria-label={ui("跳至末帧")} onClick={()=>handleSeek((video?.frames||1)-1)}><SkipForward size={16}/></button><button type="button" aria-pressed={loop} aria-label={ui("循环播放")} onClick={()=>setLoop(!loop)}><RotateCcw size={15}/></button></div>
+          <div className="transport-buttons"><button type="button" aria-label={ui("跳至首帧")} onClick={()=>handleSeek(0)}><SkipBack size={16}/></button><button type="button" aria-label={ui("后退一帧")} onClick={()=>handleSeek(currentFrame-1)}>−1</button><button type="button" className="transport-play" disabled={!renderEnabled||stillSource} onClick={togglePlay} aria-label={ui(isPlaying?'暂停播放':'开始播放')}>{ui(isPlaying?<Pause size={16}/>:<Play size={16} />)}</button><button type="button" aria-label={ui("前进一帧")} onClick={()=>handleSeek(currentFrame+1)}>+1</button><button type="button" aria-label={ui("跳至末帧")} onClick={()=>handleSeek((video?.frames||1)-1)}><SkipForward size={16}/></button><button type="button" aria-pressed={loop} aria-label={ui("循环播放")} onClick={()=>setLoop(!loop)}><RotateCcw size={15}/></button></div>
           <div className="transport-meta">{ui(video?`${video.fps||30} fps · ${video.duration_seconds.toFixed(2)} s`:'—')}</div>
         </div>)}
       </main>
-      <QualityInspector settings={settings} onSettingsChange={onSettingsChange} onStatusChange={onStatusChange}
+      <QualityInspector image={imageSource} settings={settings} onSettingsChange={onSettingsChange} onStatusChange={onStatusChange}
         primary={<>
           <PresetPicker settings={settings} onChange={handleParamsBatchChange} onStatus={onStatusChange}/>
-          <RenderPipeline image={video?.media_type==='image'} settings={settings} onChange={handleParamsBatchChange}/>
+          <RenderPipeline image={video?.media_type==='image'} settings={settings} nrModelPresets={nrModelPresets} onChange={handleParamsBatchChange}/>
           {ui(renderStages(settings).includes('nr')&&<>
           <CollapsibleSection title={ui("DLSSNR 参数")}>
           {ui(activeLayerCount(settings.reconstruction_mode || 'single') > 1 &&
@@ -957,23 +984,15 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
                 <button type="button" key={index} aria-pressed={activeLayer === index}
                   onClick={() => setSelectedLayer(index)}>{ui(`第 ${index+1} 层`)}</button>))}
             </div>)}
-          <LayerNRControls settings={settings} index={activeLayer} onChange={changeNR}/>
+          <LayerNRControls settings={settings} index={activeLayer} modelPresets={nrModelPresets} onChange={changeNR}/>
           </CollapsibleSection>
           </>)}
         </>}
         basic={<div className="dlss-inspector-content">
-          <section className="dlss-control-card"><h3>{ui("运行库")}</h3>
-            <p className="dlss-note">{ui("默认自动查找本机运行库。留空即可。")}</p>
-            {ui((settings.truehdr_enabled||hasScaleStages(settings)||(settings.frame_generation && settings.frame_generation!=='off'))&&<label className="dlss-control-label">{ui("VFX 目录覆盖")}<input aria-label={ui("VFX运行库目录")} placeholder={ui("自动查找")} value={settings.vsr_runtime_path||''} onChange={e=>handleParamChange('vsr_runtime_path',e.target.value)}/></label>)}
-            {ui(renderStages(settings).includes('dlaa')&&<label className="dlss-control-label">{ui("DLSS DLL 覆盖")}<input aria-label={ui("DLSS DLL路径")} placeholder={ui("自动查找")} value={settings.dlss_dll_path||''} onChange={e=>handleParamChange('dlss_dll_path',e.target.value)}/></label>)}
-            {ui(renderStages(settings).includes('dlaa')&&<p className="dlss-note">{ui("DLAA 支持 SDR 8/10-bit 与 HDR10；视频输入的深度和抖动为零。")}</p>)}
-            {ui(hasScaleStages(settings)&&<p className="dlss-note">{ui("VSR 10-bit / HDR 使用 VFX 1.3 RGB10A2，运行库自动检测。")}</p>)}
-          </section>
-          <section className="dlss-control-card"><div className="dlss-card-head"><div><h3>{ui("神经重建")}</h3></div></div>
-            <label className="dlss-control-label">{ui("画面风格")}<select aria-label={ui("画面风格")} value={settings.style} onChange={e=>handleParamChange('style',Number(e.target.value))}><option value={0}>{ui("默认")}</option><option value={1}>{ui("自然")}</option><option value={2}>{ui("电影")}</option></select></label>
+          {renderStages(settings).includes('nr')&&<section className="dlss-control-card"><div className="dlss-card-head"><div><h3>{ui("神经重建")}</h3></div></div>
             <label className="dlss-check-row"><input type="checkbox" checked={settings.ui_correction===1} onChange={e=>handleParamChange('ui_correction',e.target.checked?1:0)}/>{ui("NR 界面修正")}<ParameterHelp name="ui_correction" label="NR 界面修正" /></label>
-          </section>
-          <section className="dlss-control-card"><div className="dlss-card-head"><div><h3>{ui("引导与光流")}</h3></div><span className="dlss-chip">{ui(settings.flow_engine.toUpperCase())}</span></div>
+          </section>}
+          {!imageSource&&<><section className="dlss-control-card"><div className="dlss-card-head"><div><h3>{ui("引导与光流")}</h3></div><span className="dlss-chip">{ui(settings.flow_engine.toUpperCase())}</span></div>
             <label className="dlss-control-label">{ui("引导模式")}<select value={settings.guidance_mode} onChange={e=>handleParamChange('guidance_mode',Number(e.target.value))}><option value={0}>{ui("关闭 · 零运动入口")}</option><option value={1}>{ui("启用 · 光流引导")}</option></select></label>
             {ui(settings.guidance_mode===1&&<><label className="dlss-control-label">{ui("光流引擎")}<select value={settings.flow_engine} onChange={e=>handleEngineChange(e.target.value)}><option value="nvof">NVIDIA Optical Flow</option><option value="fidelityfx">AMD FidelityFX Optical Flow</option><option value="dis">OpenCV DIS</option><option value="raft">RAFT-Large</option></select></label>
               {ui(settings.flow_engine==='fidelityfx'?<label className="dlss-control-label"><span>{ui("引擎质量")}<ParameterHelp name="flow_quality_amd" label="光流质量" /></span><select aria-label={ui("AMD 光流质量")} value={settings.flow_quality==='Performance'?'Performance':'Quality'} onChange={e=>handleParamChange('flow_quality',e.target.value)}><option value="Performance">{ui("性能")}</option><option value="Quality">{ui("质量")}</option></select></label>:settings.flow_engine==='nvof'?<div className="dlss-control-grid"><label>{ui("网格")}<select value={nvofGrid} onChange={e=>handleNvofGridChange(e.target.value)}>{ui(nvofGrids.map((g:any)=><option key={g.id} value={String(g.id)}>{ui(g.id)} × {ui(g.id)}{ui(" 网格")}</option>))}</select></label><label>{ui("预设")}<select value={nvofPreset} onChange={e=>handleNvofPresetChange(e.target.value)}>{ui(nvofPresets.map((p:any)=><option key={p.id} value={p.id.toUpperCase()}>{ui(FLOW_QUALITY_LABELS[p.id.toUpperCase()] || p.label)}</option>))}</select></label></div>:<label className="dlss-control-label"><span>{ui("引擎质量")}<ParameterHelp name={settings.flow_engine==='raft'?'flow_quality_raft':'flow_quality_dis'} label="光流质量" /></span><select value={settings.flow_quality} onChange={e=>handleParamChange('flow_quality',e.target.value)}>{ui((settings.flow_engine==='dis'?['Fast','Medium','Slow']:['Fast','Balanced','Quality']).map(v=><option key={v} value={v}>{ui(FLOW_QUALITY_LABELS[v] || v)}</option>))}</select></label>)}
@@ -985,15 +1004,16 @@ export const DLSSPage: React.FC<DLSSPageProps> = ({
               {ui(settings.flow_engine==='nvof'&&<div className="provider-summary"><span className={isNvofAvailable?'provider-state-ready':'provider-state-off'}/><span>{ui(isNvofAvailable?`${displayGpu} · 设备可用`:nvofProvider?.error||'NVOF 设备不可用')}</span></div>)}
             </>)}
           </section>
-          <section className="dlss-control-card"><div className="dlss-card-head"><div><h3>{ui("导出后端")}</h3></div><span className="dlss-chip dlss-chip-export">{ui("仅导出")}</span></div><label className="dlss-control-label">{ui("执行链路")}<select aria-label={ui("导出后端")} value={settings.export_backend} onChange={e=>{if(e.target.value!=='gpu_transfer'&&(settings.reconstruction_mode||'single')!=='single'){onStatusChange?.('Dual / Triple 只支持 GPU Transfer；请先切回 Single');return}if(e.target.value!=='gpu_transfer'&&hdrOn){onStatusChange?.('实验性 HDR/scRGB 只在 GPU Transfer 上运行；请先关闭该开关');return}handleParamChange('export_backend',e.target.value)}}><option value="auto">{ui("Auto · Legacy 路径")}</option><option value="legacy">Legacy FFmpeg</option><option value="gpu_transfer">{ui("GPU Transfer · 条件不符则拒绝")}</option></select></label><p className="dlss-note">{ui("原生预览复用 GPU Transfer 处理核心；实际层数和处理帧率显示在画面中。")}</p><details className="dlss-note"><summary>{ui("支持条件与预览范围")}</summary><p>{ui("单层预览与所有导出链使用同一 GPU 宿主。关闭引导使用零运动纹理入口；开启光流需所选 NVIDIA、AMD 或 RAFT CUDA 引导后端可用。Dual / Triple 在原生预览和 GPU Transfer 导出中使用独立会话。缺少必要入口或输入条件不符时明确拒绝，不会换用其他宿主。旧 host-pointer 配置已移除，载入时须迁移到当前 GPU 宿主。")}</p></details></section>
+          <section className="dlss-control-card"><div className="dlss-card-head"><div><h3>{ui("导出后端")}</h3></div><span className="dlss-chip dlss-chip-export">{ui("仅导出")}</span></div><label className="dlss-control-label">{ui("执行链路")}<select aria-label={ui("导出后端")} value={settings.export_backend} onChange={e=>{if(e.target.value!=='gpu_transfer'&&(settings.reconstruction_mode||'single')!=='single'){onStatusChange?.('Dual / Triple 只支持 GPU Transfer；请先切回 Single');return}if(e.target.value!=='gpu_transfer'&&hdrOn){onStatusChange?.('实验性 HDR/scRGB 只在 GPU Transfer 上运行；请先关闭该开关');return}handleParamChange('export_backend',e.target.value)}}><option value="auto">{ui("Auto · Legacy 路径")}</option><option value="legacy">Legacy FFmpeg</option><option value="gpu_transfer">{ui("GPU Transfer · 条件不符则拒绝")}</option></select></label><p className="dlss-note">{ui("原生预览复用 GPU Transfer 处理核心；实际层数和处理帧率显示在画面中。")}</p><details className="dlss-note"><summary>{ui("支持条件与预览范围")}</summary><p>{ui("单层预览与所有导出链使用同一 GPU 宿主。关闭引导使用零运动纹理入口；开启光流需所选 NVIDIA、AMD 或 RAFT CUDA 引导后端可用。Dual / Triple 在原生预览和 GPU Transfer 导出中使用独立会话。缺少必要入口或输入条件不符时明确拒绝，不会换用其他宿主。旧 host-pointer 配置已移除，载入时须迁移到当前 GPU 宿主。")}</p></details></section></>}
         </div>}
         layers={<div className="dlss-inspector-content">
           <section className="dlss-control-card"><div className="dlss-card-head"><div><h3>{ui("工作分辨率")}</h3></div><span className="dlss-chip">{ui(Math.round(settings.working_scale*100))}%</span></div><label className="dlss-slider"><span>{ui("工作缩放")}<output>{ui(Math.round(settings.working_scale*100))}%</output></span><input aria-label={ui("工作分辨率缩放")} type="range" min={25} max={100} step={1} value={Math.round(settings.working_scale*100)} onChange={e=>handleWorkingScaleChange(Number(e.target.value)/100)}/></label><div className="scale-presets">{ui([1,.75,.67,.63,.5,.25].map(s=><button type="button" key={s} aria-pressed={Math.abs(settings.working_scale-s)<.005} onClick={()=>handleWorkingScaleChange(s)}>{ui(Math.round(s*100))}%</button>))}</div>{ui((()=>{const [w,h]=resolveWorkingDims(video?.width||3840,video?.height||2160,settings.working_scale);return <div className="dimension-row"><span>{ui("源 ")}{ui(video?.width||3840)} × {ui(video?.height||2160)}</span><strong>{ui("请求 ")}{ui(w)} × {ui(h)}</strong></div>})())}</section>
           <p className="dlss-note">{ui("工作缩放支持 25%–100% 的整数百分比；显示尺寸由共享解析器按 GPU 对齐规则计算。")}</p><section className="dlss-control-card"><div className="dlss-card-head"><div><h3>{ui("残差重构")}</h3></div><span className="dlss-chip">{ui(settings.residual_pyramid?'已请求':'关闭')}</span></div><label className="dlss-check-row"><input type="checkbox" checked={settings.residual_pyramid} disabled={settings.experimental_hdr_scrgb || settings.reconstruction_mode !== 'single'} title={ui("仅控制低分辨率重构时的源细节保留，不关闭 DLSSNR。HDR 与多层融合始终保留源细节。")} onChange={e=>handleParamChange('residual_pyramid',e.target.checked)}/>{ui("保留源细节残差")}</label><label className="dlss-slider"><span>{ui("残差倍率")}<output>{ui(settings.residual_strength.toFixed(2))}×</output></span><input aria-label={ui("残差倍率")} type="range" min={0} max={1.5} step={.05} value={settings.residual_strength} onChange={e=>handleParamChange('residual_strength',Number(e.target.value))}/></label></section>
           <section className="dlss-control-card"><div className="dlss-card-head"><div><h3>{ui("尺度与融合")}</h3></div><span className="dlss-chip">{ui("预览 / 导出")}</span></div><label className="dlss-control-label">{ui("重建层数")}<select value={settings.reconstruction_mode||'single'} onChange={e=>handleParamsBatchChange(chooseReconstructionMode(settings,e.target.value as DLSSSettings['reconstruction_mode']))}><option value="single">{ui("单层")}</option><option value="dual">{ui("双层")}</option><option value="triple">{ui("三层")}</option></select></label>
-            <div className="layer-diagram" aria-label={ui("请求的独立层尺寸与融合权重")}>{ui(Array.from({length:activeLayerCount(settings.reconstruction_mode||'single')},(_,i)=>{const scale=i===0?settings.working_scale:settings.layer_scales?.[i]??settings.working_scale;const [w,h]=resolveWorkingDims(video?.width||3840,video?.height||2160,scale);return <div className="layer-node" key={i}><span className="layer-index">L{ui(i+1)}</span><div><strong>{ui(w)} × {ui(h)}</strong><small>{ui(Math.round(scale*100))}% · weight {ui((settings.layer_weights?.[i]||1).toFixed(2))}</small></div>{ui(i<activeLayerCount(settings.reconstruction_mode||'single')-1&&<span className="layer-link">→</span>)}</div>}))}</div><p className="dlss-note">{ui("以上为当前请求值；下面的最近任务实际状态来自该任务的后端诊断，不代表实时预览。")}</p>
+            <div className="layer-diagram" aria-label={ui("请求的独立层尺寸与融合权重")}>{ui(Array.from({length:activeLayerCount(settings.reconstruction_mode||'single')},(_,i)=>{const scale=i===0?settings.working_scale:settings.layer_scales?.[i]??settings.working_scale;const [w,h]=resolveWorkingDims(video?.width||3840,video?.height||2160,scale);return <div className="layer-node" key={i}><span className="layer-index">L{ui(i+1)}</span><div><strong>{ui(w)} × {ui(h)}</strong><small>{ui(Math.round(scale*100))}% · weight {ui((settings.layer_weights?.[i]||1).toFixed(2))}</small></div>{ui(i<activeLayerCount(settings.reconstruction_mode||'single')-1&&<span className="layer-link">→</span>)}</div>}))}</div>{!imageSource&&<><p className="dlss-note">{ui("以上为当前请求值；下面的最近任务实际状态来自该任务的后端诊断，不代表实时预览。")}</p>
             <div className="dlss-control-card"><div className="dlss-card-head"><div><h3>{ui("最近任务实际")}</h3></div><span className="dlss-chip">{ui(recentFusionJob?.status||'暂无报告')}</span></div>{ui(recentFusionJob?<><p className="dlss-note">{recentFusionJob.name}</p>{ui(recentFusionJob.report?.fusion_mode&&<div className="dimension-row"><span>{ui("后端报告模式")}</span><strong>{ui(recentFusionJob.report.fusion_mode)}</strong></div>)}{ui(Array.isArray(recentFusionJob.report?.layer_working_dims)&&<div className="dimension-row"><span>{ui("实际层尺寸")}</span><strong>{ui(recentFusionJob.report.layer_working_dims.map((d:number[])=>`${d[0]}×${d[1]}`).join(' / '))}</strong></div>)}{ui(Array.isArray(recentFusionJob.report?.layer_dlss_calls)&&<div className="dimension-row"><span>{ui("各层 DLSS 调用数")}</span><strong>{ui(recentFusionJob.report.layer_dlss_calls.join(' / '))}</strong></div>)}{ui(Array.isArray(recentFusionJob.report?.fusion_solver_frames)&&recentFusionJob.report.fusion_solver_frames.length>0?<div className="dimension-row"><span>{ui("CG 求解帧数 / 收敛")}</span><strong>{ui(recentFusionJob.report.fusion_solver_frames.length)} / {ui(recentFusionJob.report.fusion_solver_frames.every((r:{converged?:boolean})=>r.converged)?'全部':'部分或无')}</strong></div>:recentFusionJob.report?.fusion_solver_frames?.details_omitted?<div className="dimension-row"><span>{ui("CG 求解帧数 / 收敛")}</span><strong>{ui(recentFusionJob.report.fusion_solver_frames.item_count)} / {ui(recentFusionJob.report.fusion_solver_frames.all_converged?"全部":"部分或无")}</strong></div>:<p className="dlss-note">{ui("该任务诊断未包含 CG 求解帧记录；不推断实际求解状态。")}</p>)}</>:<p className="dlss-note">{ui("尚无可读取的终态任务诊断。导出任务完成后，此处读取最新任务报告。")}</p>)}</div>
-            {ui((settings.reconstruction_mode||'single')!=='single'&&Array.from({length:activeLayerCount(settings.reconstruction_mode)},(_,i)=>{const scale=i===0?settings.working_scale:settings.layer_scales?.[i]??settings.working_scale;return <div className="layer-inputs" key={i}><strong>{ui(`第 ${i+1} 层 · ${Math.round(scale*100)}%`)}</strong><button type="button" className="button quiet" aria-expanded={expandedLayer===i} aria-controls={`nr-layer-${i}`} onClick={()=>{setSelectedLayer(i);setExpandedLayer(expandedLayer===i?null:i)}}>{ui(expandedLayer===i?"收起本层参数":"调整本层参数")}</button>{ui(i>0&&<label>{ui("独立输入比例")}<select value={Math.round(scale*100)} onChange={e=>handleLayerScaleChange(i,Number(e.target.value)/100)}>{ui(Array.from({length:76},(_,at)=>at+25).map(v=><option key={v} value={v} disabled={settings.fusion_mode!=="sequential"&&(settings.layer_scales?.some((item,at)=>at!==i&&Math.round(item*100)===v)||Math.round(settings.working_scale*100)===v)}>{ui(v)}%</option>))}</select></label>)}{ui(settings.fusion_mode!=="sequential"&&<label className="dlss-slider"><span>{ui("观测权重")}<output>{ui((settings.layer_weights?.[i]||1).toFixed(2))}</output></span><input aria-label={ui(`第 ${i+1} 层观测权重`)} type="range" min={.05} max={3} step={.05} value={settings.layer_weights?.[i]||1} onChange={e=>handleLayerWeightChange(i,Number(e.target.value))}/></label>)}{ui(expandedLayer===i&&<div id={`nr-layer-${i}`} className="layer-inline-params"><LayerNRControls settings={settings} index={i} onChange={(key,value)=>handleParamsBatchChange(changeLayerNR(settings,i,key,value))}/></div>)}</div>}))}
+</>}
+            {ui((settings.reconstruction_mode||'single')!=='single'&&Array.from({length:activeLayerCount(settings.reconstruction_mode)},(_,i)=>{const scale=i===0?settings.working_scale:settings.layer_scales?.[i]??settings.working_scale;return <div className="layer-inputs" key={i}><strong>{ui(`第 ${i+1} 层 · ${Math.round(scale*100)}%`)}</strong><button type="button" className="button quiet" aria-expanded={expandedLayer===i} aria-controls={`nr-layer-${i}`} onClick={()=>{setSelectedLayer(i);setExpandedLayer(expandedLayer===i?null:i)}}>{ui(expandedLayer===i?"收起本层参数":"调整本层参数")}</button>{ui(i>0&&<label>{ui("独立输入比例")}<select value={Math.round(scale*100)} onChange={e=>handleLayerScaleChange(i,Number(e.target.value)/100)}>{ui(Array.from({length:76},(_,at)=>at+25).map(v=><option key={v} value={v} disabled={settings.fusion_mode!=="sequential"&&(settings.layer_scales?.some((item,at)=>at!==i&&Math.round(item*100)===v)||Math.round(settings.working_scale*100)===v)}>{ui(v)}%</option>))}</select></label>)}{ui(settings.fusion_mode!=="sequential"&&<label className="dlss-slider"><span>{ui("观测权重")}<output>{ui((settings.layer_weights?.[i]||1).toFixed(2))}</output></span><input aria-label={ui(`第 ${i+1} 层观测权重`)} type="range" min={.05} max={3} step={.05} value={settings.layer_weights?.[i]||1} onChange={e=>handleLayerWeightChange(i,Number(e.target.value))}/></label>)}{ui(expandedLayer===i&&<div id={`nr-layer-${i}`} className="layer-inline-params"><LayerNRControls settings={settings} index={i} modelPresets={nrModelPresets} onChange={(key,value)=>handleParamsBatchChange(changeLayerNR(settings,i,key,value))}/></div>)}</div>}))}
             {ui((settings.reconstruction_mode||'single')!=='single'&&<><label className="dlss-control-label">{ui("融合输出")}<select value={settings.fusion_mode||'catmull_baseline'} onChange={e=>handleParamsBatchChange(chooseFusionMode(settings,e.target.value as DLSSSettings['fusion_mode']))}><option value="sequential">{ui("顺序堆叠")}</option><option value="catmull_baseline">{ui("仅第一层 · 对照")}</option><option value="data_consistency_experimental">{ui("多层融合 · 实验性")}</option></select></label>{ui(settings.fusion_mode==='data_consistency_experimental'&&<details className="solver-details"><summary>{ui("GPU CG 求解器参数")}</summary><div className="dlss-control-grid"><label>β<select value={settings.fusion_beta??.1} onChange={e=>handleParamChange('fusion_beta',Number(e.target.value))}>{ui([.01,.05,.1,.2,.5,1].map(v=><option key={v} value={v}>{ui(v)}</option>))}</select></label><label>{ui("迭代")}<select value={settings.fusion_max_iterations??128} onChange={e=>handleParamChange('fusion_max_iterations',Number(e.target.value))}>{ui([32,64,128,256,512].map(v=><option key={v} value={v}>{ui(v)}</option>))}</select></label><label>{ui("相对阈值")}<select value={settings.fusion_relative_tolerance??.001} onChange={e=>handleParamChange('fusion_relative_tolerance',Number(e.target.value))}>{ui([.01,.001,.0001,.00001].map(v=><option key={v} value={v}>{ui(v)}</option>))}</select></label></div></details>)}<p className="dlss-note">{ui("顺序堆叠逐层处理上一层结果。多尺度融合为独立分支；“仅第一层”用于对照。")}</p></>)}
           </section>
         </div>}

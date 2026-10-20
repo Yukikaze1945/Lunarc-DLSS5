@@ -45,7 +45,7 @@ export function SegmentTimeline({video,settings,currentFrame,onSeek,onSettingsCh
   const shownRange=quick??range
   const current=records.find(record=>record.frame_range.start_frame===shownRange.start_frame&&record.frame_range.end_frame===shownRange.end_frame)
   const pending=current&&['pending','running'].includes(current.status)
-  const videoSource=!!video&&video.media_type!=='image'&&!/\.(png|jpe?g|bmp|webp|tiff?|avif|heic|heif)$/i.test(video.path)
+  const videoSource=!!video&&video.media_type!=='image'&&!/\.(png|jpe?g|bmp|webp|tiff?|avif|heic|heif|jxl|jxr|wdp|hdp)$/i.test(video.path)
   const watchCache=range.enabled||!!quick
   useEffect(()=>{
     if(!videoSource||!watchCache)return

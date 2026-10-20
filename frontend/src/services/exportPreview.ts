@@ -517,6 +517,24 @@ export function buildExportPreview(
   hdr?: HdrPreviewInput
 ): ExportPreview {
   if (String(exportBackend || 'auto').toLowerCase() === 'gpu_transfer') {
+    if (gpu.ts.codec === 'prores_ks') {
+      const out = composeJobOutputPath(gpu.outputDir, gpu.fileName, gpu.ts.container, gpu.fallbackStem)
+      const stages = gpu.renderPipeline ?? ['nr']
+      const hdr10 = Boolean(hdr?.requested)
+      const trueHdr = stages.includes('truehdr')
+      const sourceMode = hdr10 ? 'HDR10 / PQ' : trueHdr ? 'TrueHDR / 线性 FP16' : gpu.sdr10 ? 'SDR 10-bit' : 'SDR 8-bit'
+      const stageNames: Record<string, string> = {nr:'DLSSNR',dlaa:'DLAA',vsr:'RTX VSR',vfg:'NVIDIA VFG',truehdr:'TrueHDR',illustration:'IllustrationJaNai V3',animesharp:'AnimeSharp V4'}
+      return {kind:'gpu-transfer-chain',command:'',copyable:false,lines:[
+        `ProRes 422 HQ · ${sourceMode} → GPU 渲染 → CPU 编码 · MOV`,
+        `渲染顺序：${stages.map(s => stageNames[s.split(':')[0]] ?? s).join(' → ')}`,
+        'GPU Transfer 执行所选图像阶段；完成后将渲染帧从 GPU 传到主机内存。',
+        'ProRes 422 输入使用 CPU 软件解码；输出使用 CPU 软件编码。',
+        '编码器预览：ffmpeg -c:v prores_ks -profile:v 3 -pix_fmt yuv422p10le -tag:v apch -f mov',
+        '固定输出：ProRes 422 HQ（10-bit 4:2:2）· MOV（.mov）；不显示硬件编码预设或码控参数。',
+        ...frameGenerationLines(gpu.frameGeneration, gpu.frameMultiplier, gpu.sourceFps, gpu.framegenTargetFps),
+        `目标文件：${out || '由源素材推导'}`,
+      ]}
+    }
     // The opt-in only changes what an export job asks for, and only on the chain that
     // can serve it: with the flag off - or with the chain on auto/legacy, where the
     // service refuses the request outright - this stays the SDR preview.

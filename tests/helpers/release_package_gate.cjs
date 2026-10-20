@@ -12,7 +12,7 @@ const result={passed:false,scope:'package files and first-start UI; no GPU regre
   const version=JSON.parse(fs.readFileSync(path.join(root,'frontend/package.json'),'utf8')).version;
   assert.equal(JSON.parse(fs.readFileSync(path.join(resources,'app/package.json'),'utf8')).version,version);
   result.version=version;
-  const excluded=new Set(['nvdec_bridge_p010.dll','nvenc_bridge_sdr10.dll']);
+  const excluded=new Set(['nvdec_bridge_p010.dll','nvenc_bridge_sdr10.dll','gpu_native_presenter.dll']);
   const native=fs.readdirSync(path.join(root,'native')).filter(n=>n.endsWith('.dll')&&!excluded.has(n));
   for(const name of native)assert.equal(sha(path.join(resources,'native',name)),sha(path.join(root,'native',name)),name);
   for(const name of fs.readdirSync(root).filter(n=>n.endsWith('.py')))

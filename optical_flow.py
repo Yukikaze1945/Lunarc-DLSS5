@@ -358,6 +358,7 @@ class NvOFHardwareEngine:
 
     def __init__(self, quality="1F", grid=None, preset=None):
         self.quality = quality
+        self._session = None
         self._bridge = _load_native_bridge()
         if not self._bridge:
             raise RuntimeError("NVIDIA Optical Flow 初始化失败: 未找到 nvof_bridge.dll 硬件桥接库。")
@@ -368,6 +369,8 @@ class NvOFHardwareEngine:
 
         self._gpu_name = probe["device"]
         self._supported_grids = probe["supported_grids"]
+        if not self._supported_grids:
+            raise RuntimeError('NVIDIA Optical Flow 初始化失败: 驱动未报告支持的输出网格。')
 
         # Parse Grid and Preset
         self._grid_size, self._perf_level = self._resolve_grid_and_preset(quality, grid, preset)

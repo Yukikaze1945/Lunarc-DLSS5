@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
 import {normalizeExportOptions, exportOptions} from '../../frontend/src/services/exportOptions.ts'
+import {readTranscodeDraft, TRANSCODE_DRAFT_KEY} from '../../frontend/src/services/exportSettings.ts'
 import {droppedMediaPath} from '../../frontend/src/services/mediaDrop.ts'
 
 const settings: any = {export_backend:'gpu_transfer', experimental_hdr_scrgb:false}
@@ -19,7 +20,7 @@ test('HDR and SDR10 constrain codec/container/profile without dropping track cop
     assert.equal(next.codec,'hevc_nvenc');assert.equal(next.container,'.mkv')
     assert.equal(next.profile,'auto');assert.equal(next.pixel_format,'auto');assert.equal(next.extra_args,'')
     assert.equal(next.audio_mode,'copy');assert.equal(next.copy_attachments,true)
-    assert.deepEqual(exportOptions(config,video,next).codec,['hevc_nvenc','av1_nvenc'])
+    assert.deepEqual(exportOptions(config,video,next).codec,['hevc_nvenc','av1_nvenc','prores_ks'])
   }
 })
 
@@ -36,6 +37,25 @@ test('WebM audio and non-MKV attachments cannot carry incompatible requests',()=
   const next=normalizeExportOptions({...tx,codec:'av1_nvenc'},settings,null)
   assert.equal(next.container,'.webm');assert.equal(next.audio_mode,'opus')
   assert.equal(next.copy_attachments,false);assert.equal(next.b_ref_mode,'auto')
+})
+test('ProRes 422 HQ is GPU-rendered, MOV-only and restores its fixed output profile',()=>{
+  const next=normalizeExportOptions({...tx,codec:'prores_ks',container:'.mkv',profile:'main',pixel_format:'auto',
+    weighted_prediction:true,b_frames:'4',b_ref_mode:'each',extra_args:'-profile:v 0'},settings,null)
+  assert.deepEqual(exportOptions(settings,null,next).codec.includes('prores_ks'),true)
+  assert.equal(next.container,'.mov');assert.equal(next.profile,'hq');assert.equal(next.pixel_format,'yuv422p10le')
+  assert.equal(next.weighted_prediction,false);assert.equal(next.b_frames,'auto');assert.equal(next.b_ref_mode,'auto')
+  assert.equal(next.extra_args,'')
+  assert.deepEqual(exportOptions({...settings,export_backend:'legacy'},null,next).codec.includes('prores_ks'),false)
+})
+test('saved ProRes draft values survive enum validation',()=>{
+  const original=(globalThis as any).localStorage
+  const saved={codec:'prores_ks',container:'.mov',profile:'hq',pixel_format:'yuv422p10le'}
+  ;(globalThis as any).localStorage={getItem:(key:string)=>key===TRANSCODE_DRAFT_KEY?JSON.stringify({settings:saved}):null}
+  try {
+    const restored=readTranscodeDraft({...tx,codec:'av1_nvenc',profile:'auto',pixel_format:'auto'} as any)
+    assert.equal(restored.codec,'prores_ks');assert.equal(restored.container,'.mov')
+    assert.equal(restored.profile,'hq');assert.equal(restored.pixel_format,'yuv422p10le')
+  } finally { (globalThis as any).localStorage=original }
 })
 test('media drop selects first supported real file and skips text or synthetic paths',()=>{
   const files:any[]=[{name:'note.txt',path:'note'},{name:'cover.PNG',path:''},{name:'电影.mkv',path:'D:\\电影.mkv'},{name:'image.jpg',path:'D:\\image.jpg'}]

@@ -37,11 +37,14 @@ class SelectedDecoder:
                 return code
             self.origin = int(frame.pts) * frame.time_base_num / frame.time_base_den
             if self.selection['start_frame']:
-                lib = self.chain.b['nvdec']
-                lib.nvdec_bridge_seek_us.argtypes = [C.c_void_p, C.c_int64]
-                lib.nvdec_bridge_seek_us.restype = C.c_int32
-                code = int(lib.nvdec_bridge_seek_us(self.chain.decoder,
-                    round(self.selection['start_frame'] / self.fps * 1e6)))
+                seek_us = round(self.selection['start_frame'] / self.fps * 1e6)
+                if hasattr(self.chain, 'seek_decoder'):
+                    code = int(self.chain.seek_decoder(seek_us))
+                else:
+                    lib = self.chain.b['nvdec']
+                    lib.nvdec_bridge_seek_us.argtypes = [C.c_void_p, C.c_int64]
+                    lib.nvdec_bridge_seek_us.restype = C.c_int32
+                    code = int(lib.nvdec_bridge_seek_us(self.chain.decoder, seek_us))
                 if code:
                     raise RuntimeError(f'选区定位失败 ({code})')
                 code = self.chain.next_frame(frame)

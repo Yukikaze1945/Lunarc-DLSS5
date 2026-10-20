@@ -8,7 +8,10 @@ import cv2
 import numpy as np
 from PIL import Image, ImageCms, ImageOps, features
 
-EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tif', '.tiff', '.avif', '.heic', '.heif','.jxl')
+from jxr_image_decode import EXTENSIONS as JXR_EXTENSIONS
+
+
+EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tif', '.tiff', '.avif', '.heic', '.heif','.jxl') + JXR_EXTENSIONS
 
 
 def heif_plugin():
@@ -28,7 +31,8 @@ def export_formats():
         pass
     from image_extra_codecs import capabilities
     return dict(png=True, jpeg=True, webp=features.check('webp'),
-                avif=features.check('avif'), heic=heic,jxl=capabilities()['jxl']['available'],uhdr=False)
+                avif=features.check('avif'), heic=heic, heif=heic,
+                jxl=capabilities()['jxl']['available'],uhdr=False)
 
 
 def is_image(path):
@@ -70,6 +74,15 @@ def _read_sdr_rgba(path):
         source = heif_plugin().open_heif(path, convert_hdr_to_8bit=False)
         if source.info.get('bit_depth',8) > 8:
             raise ValueError('当前图片入口支持 8-bit 图片；高位深 HEIC 不会自动降为 8-bit')
+    elif extension in JXR_EXTENSIONS:
+        from jxr_image_decode import read_rgba8
+        rgba, profile = read_rgba8(path)
+        if profile:
+            image = ImageCms.profileToProfile(Image.fromarray(rgba[:,:,:3]),
+                ImageCms.ImageCmsProfile(io.BytesIO(profile)), ImageCms.createProfile('sRGB'),
+                outputMode='RGB')
+            rgba = np.dstack((np.asarray(image), rgba[:,:,3]))
+        return np.ascontiguousarray(rgba)
     elif extension == '.avif':
         # Pillow's AVIF decoder always returns 8-bit; verify original precision first.
         import pipeline
@@ -219,7 +232,7 @@ def output_extent(width, height, source, settings):
 
 
 FORMATS = {'png': ('.png', 'PNG'), 'jpeg': ('.jpg', 'JPEG'), 'webp': ('.webp', 'WEBP'),
-           'avif': ('.avif', 'AVIF'), 'heic': ('.heic', 'HEIF'),
+           'avif': ('.avif', 'AVIF'), 'heic': ('.heic', 'HEIF'), 'heif': ('.heif', 'HEIF'),
            'jxl': ('.jxl','JXL'),'uhdr': ('.jpg','UHDR')}
 
 
@@ -232,14 +245,14 @@ def validate_destination(path, output_path, fmt, quality, overwrite=False, color
         from image_hdr_export import capabilities
         info = capabilities().get(fmt)
         if not info or not info['available']:
-            raise ValueError(info['reason'] if info else 'HDR 图片请选择 AVIF、HEIC、UHDR 或 JXL')
+            raise ValueError(info['reason'] if info else 'HDR 图片请选择 AVIF、HEIC、HEIF、UHDR 或 JXL')
     elif fmt == 'uhdr':
         raise ValueError('UHDR JPEG 需要 HDR 渲染结果；保存普通 SDR 请选 JPEG')
     elif fmt == 'jxl':
         from image_extra_codecs import capabilities
         info=capabilities()['jxl']
         if not info['available']:raise ValueError(info['reason'])
-    elif fmt == 'heic':
+    elif fmt in ('heic', 'heif'):
         heif_plugin()
     elif fmt == 'avif' and not features.check('avif'):
         raise ValueError('当前 Pillow 缺少 AVIF 编码支持，请安装项目依赖后重启')
@@ -272,7 +285,7 @@ def save_image(path, rgba, output_path, fmt, quality=95, preserve_alpha=True, ov
         if fmt == 'jpeg': opts['subsampling'] = 0
         if fmt == 'webp': opts.update(lossless=quality == 100, exact=True)
         if fmt == 'avif': opts.update(subsampling='4:4:4',speed=6,max_threads=8)
-        if fmt == 'heic':
+        if fmt in ('heic', 'heif'):
             opts.update(chroma=444,color_primaries=1,transfer_characteristic=13,full_range_flag=1)
             if quality == 100: opts.update(quality=-1,matrix_coefficients=0)
         if fmt=='jxl':

@@ -16,6 +16,5 @@ httpx>=0.28,<1
 # ---- desktop GUI (gui.py) ----
 Pillow>=11.3
 pillow-heif==1.8.1
-# ---- optional: faster/more robust decode path (SmartCapture falls back to
-# ---- FFmpeg CLI pipe when PyAV is absent, so this is recommended, not required)
-av>=11.0
+# ---- video decode; required for the ProRes 422 HQ software codec boundary
+av>=16.1

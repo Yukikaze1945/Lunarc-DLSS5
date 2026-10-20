@@ -300,7 +300,8 @@ GPU_HDR_API void gpu_hdr_fill_contract(GpuHdrContract* out_contract);
 /* Additive resource-purpose API; old open entries retain full-pipeline ABI 1. */
 enum GpuHdrPurpose {
     GPU_HDR_PURPOSE_FULL = 0, GPU_HDR_PURPOSE_GUIDANCE = 1,
-    GPU_HDR_PURPOSE_DECODE = 2, GPU_HDR_PURPOSE_ENCODE = 3
+    GPU_HDR_PURPOSE_DECODE = 2, GPU_HDR_PURPOSE_ENCODE = 3,
+    GPU_HDR_PURPOSE_DECODE422 = 4, GPU_HDR_PURPOSE_ENCODE422 = 5
 };
 GPU_HDR_API int32_t gpu_hdr_open_purpose(void* device, void* context,
     uint32_t width, uint32_t height, uint32_t low_width, uint32_t low_height,
@@ -318,7 +319,7 @@ GPU_HDR_API int32_t gpu_hdr_open(void* d3d12_device, void* cuda_context,
     const GpuHdrTapTable* reconstruct_plan, double paper_white_scrgb,
     GpuHdrBridge** out_bridge);
 
-/* Additive SDR10 variant. Inputs and outputs are limited-range BT.709 P010;
+/* Additive SDR10 variant. Inputs and outputs are limited-range BT.709 P010 or P210 according to bridge purpose;
  * the FP16 master is relative linear Rec.709 (1.0 == reference white), not
  * scRGB nits. paper_white_scrgb must be exactly 1.0. Shared stage/report/close
  * APIs operate on either bridge mode; gpu_hdr_decode remains HDR-only. */

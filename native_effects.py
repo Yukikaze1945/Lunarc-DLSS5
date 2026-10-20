@@ -133,7 +133,9 @@ def validate(settings, source):
     if ordered == ['nr']:
         return
     image_input = source.get('media_type') == 'image' and source.get('pix_fmt') in ('rgba','rgba16f')
-    wide = source.get('pix_fmt') in ('yuv420p10le', 'p010le', 'p010') or (image_input and source.get('pix_fmt')=='rgba16f')
+    from prores_decode import is_prores
+    prores_input = is_prores(source)
+    wide = prores_input or source.get('pix_fmt') in ('yuv420p10le', 'p010le', 'p010') or (image_input and source.get('pix_fmt')=='rgba16f')
     if source.get('color_transfer') == 'arib-std-b67':
         raise ValueError('HLG is unsupported by the existing native HDR10/PQ chain')
     if source.get('color_transfer') == 'smpte2084' and not wide:
@@ -141,7 +143,7 @@ def validate(settings, source):
     if any(stage_kind(stage)=='vsr' and (wide or 'truehdr' in ordered[:index]) for index,stage in enumerate(ordered)):
         from native_runtime_paths import wide_vfx_runtime
         wide_vfx_runtime(settings.get('vsr_runtime_path'))
-    if not image_input and source.get('pix_fmt') not in ('yuv420p', 'nv12', 'yuv420p10le', 'p010le', 'p010'):
+    if not image_input and not prores_input and source.get('pix_fmt') not in ('yuv420p', 'nv12', 'yuv420p10le', 'p010le', 'p010'):
         raise ValueError('Native stages require a supported 8-bit or 10-bit YUV source')
     if settings.get('export_backend') != 'gpu_transfer':
         raise ValueError('Native DLAA / RTX VSR requires GPU Transfer')
@@ -247,7 +249,7 @@ def make_live(width, height, settings, *, wide=False):
         except Exception:
             owner.close()
             raise
-    if (settings.get('render_pipeline') is not None or 'vfg' in ordered) and 'nr' not in ordered:
+    if (settings.get('render_pipeline') is not None or 'vfg' in ordered or len(ordered) > 1) and 'nr' not in ordered:
         # Explicit ordered DLAA runs in OutputEffect, including FP16. The core
         # only forwards the decoded picture; evaluating its owner here as well
         # would bind one DLAA host to two independent NVOF contexts in one frame.

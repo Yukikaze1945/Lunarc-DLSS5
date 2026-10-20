@@ -77,6 +77,7 @@ import numpy as np
 
 import bundle_paths
 import pipeline
+from native_watchdog import phase as native_phase
 from layer_settings import layer_parameters, resolve_layer_settings
 import transfer_profiler
 
@@ -863,6 +864,7 @@ def probe_source(video: str, ffprobe=None, include_chapters: bool = False,
     probed = {
         "video_stream_count": len(video_streams),
         "codec_name": first.get("codec_name"),
+        "profile": first.get("profile"),
         "pix_fmt": first.get("pix_fmt"),
         "width": int(first.get("width") or 0),
         "height": int(first.get("height") or 0),
@@ -918,6 +920,11 @@ def plan_encoder(transcode_settings, cq: int, source: dict,
     rather than dropped on the way to NVENC.
     """
     ts = dict(transcode_settings or {})
+    if ts.get('codec') == 'prores_ks':
+        from prores_export import encoder_plan
+        plan = encoder_plan(ts, source)
+        plan['struct']['color_matrix'] = color_matrix
+        return plan
     unsupported = []
     codec = str(ts.get("codec", "av1_nvenc"))
     if codec not in SUPPORTED_CODECS:
@@ -1807,6 +1814,8 @@ class Chain:
         self.encoder_output = encoder_output
         self.live = live
         self.plan = plan
+        from prores_export import ProResOutput
+        self.prores_output = ProResOutput(self) if plan.get('codec') == 'prores_ks' and preview_consumer is None else None
         self.fps = fps
         self.strength = strength
         self.working = (int(working[0]), int(working[1]))
@@ -1921,6 +1930,8 @@ class Chain:
         self._open_encoder(dlss, frame, getattr(self, 'export_size', (frame.width, frame.height)))
 
     def _open_encoder(self, dlss, frame, size):
+        if self.prores_output is not None:
+            return
         struct = self.plan["struct"]
         blob = extra_options_blob(self.plan["av_options"])
         options = _NvencOptions(C.sizeof(_NvencOptions), struct["codec"],
@@ -1983,6 +1994,11 @@ class Chain:
             self.truehdr_tail.encode(self,candidate,frame)
             return None
         candidate = self._resize_output(candidate, frame, stages)
+        if self.prores_output is not None:
+            mark = time.perf_counter()
+            self.prores_output.encode(candidate, frame)
+            stages['prores_cpu_encode'] = (time.perf_counter()-mark)*1000
+            return None
         if self.encoder is None and (self.output_effect is not None or getattr(self, 'export_resize', None) is not None or getattr(self,'_defer_layer_output',False)):
             self._open_encoder(candidate, frame, (candidate.get('width', frame.width), candidate.get('height', frame.height)))
         mark = time.perf_counter() if started is None else started
@@ -2188,6 +2204,9 @@ class Chain:
             self.truehdr_tail.encode(self,texture,frame,pts)
             return
         texture = self._resize_output(texture, frame, {})
+        if self.prores_output is not None:
+            self.prores_output.encode(texture, frame, pts)
+            return
         if self.encoder is None:
             self._open_encoder(texture, frame, (texture['width'], texture['height']))
         code = self.b['nvenc'].nvenc_encode_texture(self.encoder, texture['d3d12_resource'],
@@ -2211,6 +2230,8 @@ class Chain:
 
     def counters(self):
         out = {}
+        if self.prores_output is not None:
+            out['prores_output'] = self.prores_output.report()
         if getattr(self,'truehdr_tail',None): out['truehdr'] = self.truehdr_tail.report()
         if getattr(self, 'export_resize', None):
             out['export_resize'] = self.export_resize.report()
@@ -2278,6 +2299,7 @@ class Chain:
             if code:
                 _bridge_error(self.b["nvenc"], "nvenc_last_error", code)
         if getattr(self,'truehdr_tail',None): self.truehdr_tail.finish()
+        if self.prores_output is not None: self.prores_output.finish()
 
     def close(self):
         # Reverse creation order: each bridge borrows the device or context of
@@ -2289,6 +2311,7 @@ class Chain:
         # is idempotent, so the session owner may still call it afterwards.
         from gpu_cleanup import release_owned, finish_cleanup
         errors = []
+        release_owned(self, 'prores_output', errors)
         release_owned(self, 'post_control', errors)
         release_owned(self, 'temporal_control', errors)
         for name in ('truehdr_tail','export_resize', 'framegen_tail', 'ordered_framegen', 'framegen', 'framegen_output', 'framegen_input',
@@ -2703,7 +2726,7 @@ def export_gpu_transfer(video, live, flow_provider, out_path, dims, frames,
     pipeline.assert_output_not_input(video, out_path)
     intermediate = None
     if negotiation["copy_pass"]:
-        handle, intermediate = tempfile.mkstemp(suffix=INTERMEDIATE_CONTAINER,
+        handle, intermediate = tempfile.mkstemp(suffix='.mov' if (transcode_settings or {}).get('codec') == 'prores_ks' else INTERMEDIATE_CONTAINER,
                                                 prefix="dlss_gpu_transfer_")
         os.close(handle)
         os.unlink(intermediate)
@@ -2845,6 +2868,7 @@ def _export_gpu_transfer(video, live, flow_provider, out_path, dims, frames,
     counters = {}
     profiler.start()
     try:
+        native_phase('打开 GPU 解码器', 300)
         chain.open_decoder()
         frame = _DeviceFrame()
         frame.struct_size = C.sizeof(_DeviceFrame)
@@ -2858,6 +2882,7 @@ def _export_gpu_transfer(video, live, flow_provider, out_path, dims, frames,
                     f"GPU 转码管线在第 {processed} 帧严重停滞（超过 {WATCHDOG_TIMEOUT_SEC} "
                     f"秒无有效帧），NVDEC / Feature18 / NVENC 可能已死锁")
             t_decode = time.perf_counter()
+            native_phase(f'GPU 解码第 {processed + 1} 帧', 300)
             state = selected_decoder.next(frame)
             decode_ms = (time.perf_counter() - t_decode) * 1000.0
             if state == 0:
@@ -2878,6 +2903,7 @@ def _export_gpu_transfer(video, live, flow_provider, out_path, dims, frames,
                 isinstance(chain, MultiScaleObservationChain) and
                 _frame_timestamp_discontinuity(previous_timestamp, frame, fps)))
             with _session(lock):
+                native_phase(f'GPU 处理第 {processed + 1} 帧', 300)
                 outcome = chain.process(frame, flow_provider, processed,
                                         is_discontinuous=discontinuous)
             previous_timestamp = (int(frame.pts), int(frame.time_base_num),
@@ -2924,15 +2950,15 @@ def _export_gpu_transfer(video, live, flow_provider, out_path, dims, frames,
                          f"[GPU 显存直传导出] {processed}/{frames} "
                          f"({processed / frames * 100:.1f}%) | "
                          f"{processed / elapsed:.1f} fps")
+        native_phase('排空 GPU 编码器', 180)
         chain.finish()
     except Exception:
         failed = True
         raise
     finally:
-        # The cancel is checked between frames, so the worst-case latency is one
-        # decoded frame; this tells the decoder to stop draining whatever is left
-        # before the bridges go away. A watchdog cannot cover a decode that never
-        # returns, because the loop and the decoder share this thread.
+        # The independent watchdog observes hangs inside these calls. It only
+        # requests process recovery; this owner thread performs normal cleanup.
+        native_phase('关闭 GPU 导出链路', 90)
         try:
             chain.cancel_decoder()
         except Exception as cancel_error:
@@ -2958,6 +2984,8 @@ def _export_gpu_transfer(video, live, flow_provider, out_path, dims, frames,
                 pass
         profiler.print_summary(f"GPU TRANSFER EXPORT ({processed} FRAMES)")
 
+    native_phase('导出报告及容器封装', None)
+
     report = transfer_report(counters, processed, src_w, src_h,
                              downscaled=downscaled, working=(live_w, live_h))
     report["post_control"] = counters.get("post_control")
@@ -2972,6 +3000,12 @@ def _export_gpu_transfer(video, live, flow_provider, out_path, dims, frames,
     report["temporal_control"] = counters.get("temporal_control")
     report["export_backend_requested"] = str(js.get("export_backend", "auto"))
     report["export_backend_actual"] = "gpu_transfer"
+    if counters.get('prores_output'):
+        report['export_backend_actual'] = 'gpu_render_cpu_prores'
+        report['prores_output'] = counters['prores_output']
+        report['zero_copy'] = False
+        report['encoder_host_pixel_bytes_measured'] = counters['prores_output']['frame_host_readback_bytes']
+        report['encoder_frames_submitted_measured'] = counters['prores_output']['frames_submitted']
     report["export_backend_fallback_reason"] = None
     report["gpu_transfer_color_matrix"] = negotiation["declared_color_space"]
     report["gpu_transfer_encoder_codec"] = plan["codec"]

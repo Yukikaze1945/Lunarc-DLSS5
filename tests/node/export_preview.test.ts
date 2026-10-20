@@ -358,6 +358,20 @@ test('only the GPU-transfer chain previews HDR, and only when it was opted into'
   assert.doesNotMatch(off.lines.join('\n'), /scRGB/)
 })
 
+test('ProRes GPU preview describes host transfer and CPU HQ MOV encoding',()=>{
+  const preview=buildExportPreview('gpu_transfer',legacyInput,{...gpuInput,
+    ts:{...SETTINGS,codec:'prores_ks',container:'.mov',profile:'hq',pixel_format:'yuv422p10le'},
+    renderPipeline:['nr','vsr']}, {requested:true,ts:{...SETTINGS,codec:'prores_ks',container:'.mov',profile:'hq',pixel_format:'yuv422p10le'},
+    guidanceMode:0,flowEngine:'nvof',workingScale:.5,residualPyramid:true,sourceFps:120,
+    outputDir:'C:\\Videos',fileName:'clip_prores',fallbackStem:'clip',paperWhiteScrgb:8,
+    sourceWidth:1920,sourceHeight:1080})
+  const text=preview.lines.join('\n')
+  assert.match(text,/GPU 渲染/);assert.match(text,/主机内存/)
+  assert.match(text,/prores_ks -profile:v 3 -pix_fmt yuv422p10le -tag:v apch -f mov/)
+  assert.doesNotMatch(text,/NVENC|zeroCopy|零拷贝/)
+  assert.equal(preview.copyable,false);assert.equal(preview.command,'')
+})
+
 test('the HDR chain is a device chain with no command to copy', () => {
   const preview = buildExportPreview('gpu_transfer', legacyInput, gpuInput, hdrInput)
 

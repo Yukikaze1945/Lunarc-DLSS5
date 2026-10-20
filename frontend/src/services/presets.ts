@@ -28,6 +28,7 @@ export function samePreset(a:Partial<DLSSSettings>,b:Partial<DLSSSettings>):bool
 const KEY='lunarc.presets.v1'
 const MIGRATED='lunarc.presets.backend-migrated.v1'
 let snapshot:Preset[]=[]
+let cacheLoaded=false
 let initialized=false, initializing:Promise<void>|null=null
 let writeQueue=Promise.resolve()
 const API='http://127.0.0.1:18923/api/presets'
@@ -63,7 +64,7 @@ function enqueue<T>(operation:()=>Promise<T>):Promise<T>{const result=writeQueue
 function reportSyncError(error:unknown){window.dispatchEvent(new CustomEvent('lunarc:preset-error',{detail:{message:error instanceof Error?error.message:'预设同步失败'}}))}
 export function initializePresets():Promise<void>{return initialize().catch(error=>{reportSyncError(error);throw error})}
 export function presetSnapshot():Preset[] {
-  if(!initialized&&snapshot.length===0)snapshot=cached()
+  if(!cacheLoaded){cacheLoaded=true;snapshot=cached()}
   return snapshot
 }
 export function subscribePresets(listener:()=>void) {
@@ -113,7 +114,7 @@ export async function importPresets(presets:Preset[]):Promise<void>{
   }).catch(error=>{reportSyncError(error);throw error})
 }
 
-const labels:Record<string,string>={render_pipeline:'渲染顺序',style:'画面风格',intensity:'NR 强度',local_tone:'局部色调强度',
+const labels:Record<string,string>={preset:'NR 模型',render_pipeline:'渲染顺序',style:'画面风格',intensity:'NR 强度',local_tone:'局部色调强度',
   local_struct:'局部结构强度',skin_struct:'皮肤结构强度',use_auto_mask:'自动遮罩',ui_correction:'NR 界面修正',
   guidance_mode:'光流引导',flow_engine:'光流引擎',flow_quality:'光流质量',working_scale:'工作缩放',
   reconstruction_mode:'重建层数',layer_execution:'图层执行方式',layer_scales:'图层缩放',layer_weights:'图层权重',
@@ -135,6 +136,7 @@ const words:Record<string,string>={nr:'DLSSNR',dlaa:'DLAA',vsr:'RTX VSR',vfg:'NV
   catmull_baseline:'仅第一层',data_consistency_experimental:'多层融合',scale:'按倍率',resolution:'按分辨率',
   nvof:'NVIDIA 光流',fidelityfx:'AMD 光流',raft:'RAFT',raft_large:'RAFT-Large',gpu_transfer:'GPU Transfer',auto:'自动',legacy:'Legacy'}
 export function presetValue(key:string,value:unknown):string {
+  if(key==='preset')return ({0:'运行库原有默认值',1:'A',2:'B',3:'旧预设 3'} as Record<string,string>)[String(value)]??String(value)
   if(value===undefined||value===null)return '默认'
   if(Array.isArray(value))return value.map(v=>presetValue(key,v)).join(' / ')
   if(typeof value==='boolean')return value?'开启':'关闭'
@@ -174,15 +176,15 @@ export function presetChanges(settings:DLSSSettings):PresetChange[] {
       return
     }
     if(key==='frame_generation_saved_mode')return
-    if(key==='preset'||key==='neural_mode'||key==='dlss_backend'||key.startsWith('_'))return
+    if(key==='neural_mode'||key==='dlss_backend'||key.startsWith('_'))return
     const delta=typeof value==='number'&&typeof base==='number'&&
-      !['style','use_auto_mask','ui_correction','guidance_mode','dlaa_preset','vsr_quality','framegen_quality','roi_kind','debug_mode'].includes(key)?value-base:undefined
+      !['preset','style','use_auto_mask','ui_correction','guidance_mode','dlaa_preset','vsr_quality','framegen_quality','roi_kind','debug_mode'].includes(key)?value-base:undefined
     changes.push({key:path,label:labels[key]??key,before:presetValue(key,base),after:presetValue(key,value),delta,
       percent:delta!==undefined&&base!==0?delta/Math.abs(base)*100:undefined})
   }
   for(const [key,value] of Object.entries(current)){
     if(key==='layer_settings'){
-      const nr={style:0,intensity:1,local_tone:1,local_struct:1,skin_struct:1,use_auto_mask:1,ui_correction:0}
+      const nr={preset:1,style:0,intensity:1,local_tone:1,local_struct:1,skin_struct:1,use_auto_mask:1,ui_correction:0}
       ;(value as Record<string,number>[]|undefined)?.forEach((layer,index)=>{if(index)visit(layer,nr,`第 ${index+1} 层`)})
     }else visit(value,(baseline as any)[key],key)
   }

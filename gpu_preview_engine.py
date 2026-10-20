@@ -10,6 +10,7 @@ import os
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 
 import cv2
 import numpy as np
@@ -20,6 +21,7 @@ import gpu_transfer_export as gtx
 import gpu_hdr_transfer_export as htx
 import pipeline
 import native_effects
+from native_watchdog import phase as native_phase
 from layer_settings import layer_parameters, resolve_layer_settings
 
 
@@ -174,8 +176,42 @@ class GpuPreview:
         self._capture_image_master = False
         self._image_checkpoint_pixels = None
 
+    def _submit(self, function, *args):
+        # Carry only observation context; the native call stays on its GPU owner.
+        return self.executor.submit(copy_context().run, function, *args).result()
+
     def render_image(self, path, settings, memory_mode='memory'):
-        return self.executor.submit(self._render_image, path, dict(settings), memory_mode).result()
+        return self._submit(self._render_image, path, dict(settings), memory_mode)
+
+    def render_video_frame(self, path, settings, index):
+        return self._submit(self._render_video_frame,path,dict(settings),index)
+
+    def _render_video_frame(self, path, settings, index):
+        from image_render import source_key, signature, make_result, sdr_pixels, video_frame_settings
+        initial_key = source_key(path)
+        options = video_frame_settings(settings)
+        self._capture_image_master = True
+        self._capture_frame_source = True
+        self._captured_image_master = self._captured_frame_source = None
+        try:
+            # Force a full processing pass, not a resized/composited display cache.
+            _,_,diagnostics = self._render(path,options,index,need_source=False,reuse_display=False,native=False)
+            if self._captured_image_master is None or self._captured_frame_source is None:
+                raise RuntimeError('单帧渲染未返回完整尺寸结果')
+            pixels,hdr = self._captured_image_master
+            original,source_hdr = self._captured_frame_source
+            if not hdr:pixels = sdr_pixels(pixels)
+            if not source_hdr:original = sdr_pixels(original)
+            result = make_result(path,initial_key,settings,original,pixels,hdr,diagnostics)
+            result.frame_index = index
+            result.settings_key = signature(settings,video_frame=True)
+            self.image_results.put(result)
+            return result.info()
+        finally:
+            self._capture_image_master = self._capture_frame_source = False
+            self._captured_image_master = self._captured_frame_source = None
+            # Single-frame mode holds the host result, not the model sessions.
+            self._release_memory('video_single_frame',preserve_display=True)
 
     def _render_image(self, path, settings, memory_mode='memory'):
         from image_render import image_settings, source_key, signature, render_passes, make_result
@@ -268,7 +304,7 @@ class GpuPreview:
                                resources_released=True,report=report)
 
     def present_image_result(self, result_id, reference_id=None):
-        return self.executor.submit(self._present_image_result,result_id,reference_id).result()
+        return self._submit(self._present_image_result,result_id,reference_id)
 
     def _freeze_native_display(self):
         current=self.native_presenter
@@ -343,12 +379,12 @@ class GpuPreview:
             return display.report() if display else dict(native=False,pending=bool(self.native_config))
 
     def render(self, video, settings, frame_index, *, need_source=True, reuse_display=False, display_edge=0, flow_view=False, native=False):
-        return self.executor.submit(self._render, video, dict(settings), int(frame_index),
-                                    need_source, reuse_display, display_edge, flow_view, native).result()
+        return self._submit(self._render, video, dict(settings), int(frame_index),
+                            need_source, reuse_display, display_edge, flow_view, native)
 
     def export_image(self, path, settings, output_path, fmt, quality, preserve_alpha, overwrite, color_mode='sdr'):
-        return self.executor.submit(self._export_image, path, dict(settings), output_path,
-                                    fmt, quality, preserve_alpha, overwrite, color_mode).result()
+        return self._submit(self._export_image, path, dict(settings), output_path,
+                            fmt, quality, preserve_alpha, overwrite, color_mode)
 
     def _export_image(self, path, settings, output_path, fmt, quality, preserve_alpha, overwrite, color_mode='sdr'):
         from image_source import is_image
@@ -361,14 +397,15 @@ class GpuPreview:
             validate_request(settings, fmt, path, preserve_alpha)
         from image_render import save_result
         info=self._render_image(path,settings,settings.get('image_memory_mode','memory'))
+        native_phase('图片格式编码', None)
         return save_result(self.image_results.get(info['id']),output_path,fmt,quality,
                            preserve_alpha,overwrite,color_mode)
 
     def close(self):
-        self.executor.submit(self._close).result()
+        self._submit(self._close)
 
     def release_memory(self):
-        return self.executor.submit(self._release_memory).result()
+        return self._submit(self._release_memory)
 
     def _release_memory(self,reason='manual',before=None,preserve_display=False):
         import gc,sys
@@ -392,7 +429,7 @@ class GpuPreview:
 
     def shutdown(self):
         self.close()
-        self.executor.submit(self.raft_shared.clear).result()
+        self._submit(self.raft_shared.clear)
         self.image_results.clear()
         self.executor.shutdown(wait=True)
 
@@ -500,9 +537,11 @@ class GpuPreview:
         self.bridges = gtx.load_bridges(requires_flow=uses_flow,
             requires_multiscale=len(self.multi['scales']) > 1)
         self.hdr = source.get('color_transfer') == 'smpte2084'
+        from prores_decode import is_prores
+        prores_source = is_prores(source)
         # Precision selects the decoder path; colour admission belongs to that
         # path's gate. Never send a 10-bit source to the NV12-only gate.
-        self.sdr10 = source.get('pix_fmt') == 'yuv420p10le' and not self.hdr
+        self.sdr10 = (source.get('pix_fmt') == 'yuv420p10le' or prores_source) and not self.hdr
         if source.get('color_transfer') == 'arib-std-b67':
             raise ValueError('HLG GPU preview is not validated; no SDR conversion fallback')
         wide = self.hdr or self.sdr10
@@ -596,9 +635,12 @@ class GpuPreview:
         if decoder_reuse:
             self.source_origin = decoder_reuse['origin']
         else:
-            raw = (b'{"frames": []}' if source.get('media_type') == 'image' else subprocess.check_output([pipeline._bundle_ffprobe(), '-v', 'error',
-                '-select_streams', 'v:0', '-read_intervals', '%+#1', '-show_frames',
-                '-show_entries', 'frame=best_effort_timestamp_time', '-of', 'json', video]))
+            try:
+                raw = (b'{"frames": []}' if source.get('media_type') == 'image' else subprocess.check_output([pipeline._bundle_ffprobe(), '-v', 'error',
+                    '-select_streams', 'v:0', '-read_intervals', '%+#1', '-show_frames',
+                    '-show_entries', 'frame=best_effort_timestamp_time', '-of', 'json', video], timeout=10))
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(f"ffprobe timed out after 10 seconds while reading source presentation timestamp: {video}") from exc
             frames = json.loads(raw).get('frames', [])
             self.source_origin = float(frames[0]['best_effort_timestamp_time']) if frames else 0.0
         self.fps = negotiation['fps'][0] / negotiation['fps'][1]
@@ -681,6 +723,12 @@ class GpuPreview:
                    for index, owner in enumerate(owners)
                    if baked_option_key(resolve_layer_settings(self.active_settings, index)) !=
                       baked_option_key(resolve_layer_settings(settings, index))]
+        # Preset is create-only. Preflight every layer before hot-updating any
+        # owner, so a model change closes the old pipeline before opening a new one.
+        if any(baked_option_key(resolve_layer_settings(self.active_settings, index))[0] !=
+               baked_option_key(resolve_layer_settings(settings, index))[0]
+               for index in range(len(owners))):
+            return False
         self.runtime_updated_layers = {index for index, owner in enumerate(owners)
                                        if any(owner is item[0] for item in updates)}
         if updates:
@@ -804,6 +852,9 @@ class GpuPreview:
     def _consume_image_master(self,candidate,frame):
         from image_render import download,display_bgr
         started=time.perf_counter()
+        if getattr(self,'_capture_frame_source',False):
+            candidate=dict(candidate)
+            candidate.setdefault('output_hdr',bool(self.hdr))
         pixels,hdr=download(candidate,frame)
         self._captured_image_master=pixels,hdr
         self.result_bgr=display_bgr(pixels,hdr)
@@ -961,18 +1012,23 @@ class GpuPreview:
                 if not runtime_changed:
                     changed = ({k for k in self.active_settings.keys() | settings.keys()
                                 if self.active_settings.get(k) != settings.get(k)} if self.active_settings else set())
-                    if same_source and changed and changed <= {'vsr_mode','vsr_quality','vsr_strength'} and self.chain.decoder:
+                    if (same_source and changed and changed <= {'vsr_mode','vsr_quality','vsr_strength'}
+                            and self.chain.decoder and not getattr(self.chain, 'prores_input', False)):
                         self.lifecycle_phase = 'resize VSR pipeline, retain decoder'
                         self._reopen_vsr_with_decoder(video, settings)
                     else:
                         self.lifecycle_phase = 'close previous pipeline'
                         self._close(preserve_display=True)
                         self.lifecycle_phase = 'open new pipeline'
+                        native_phase('初始化预览链路',
+                                     600 if is_image(video) or self._capture_image_master else 300)
                         self._open(video, settings)
                 self.key = key
                 self.active_settings = dict(settings)
                 self.cold_memory_check=False
             self.lifecycle_phase = 'render frame'
+            native_phase('处理预览帧',
+                         600 if is_image(video) or self._capture_image_master else 300)
             setup_ms = (time.perf_counter() - setup) * 1000
             if (reuse_display and self.cached_display is not None and self.last_index == index
                     and self.cached_edge == self.display_edge
@@ -997,15 +1053,22 @@ class GpuPreview:
                         (self.last_index is not None and (index <= self.last_index or
                          index - self.last_index > max(8, int(self.fps * 2)))))
                 if seek:
-                    code = self.bridges['nvdec'].nvdec_bridge_seek_us(self.chain.decoder,
-                                                                     round(target * 1e6))
+                    if getattr(self.chain, 'prores_input', False):
+                        code = self.chain.seek_decoder(round(target * 1e6))
+                    else:
+                        code = self.bridges['nvdec'].nvdec_bridge_seek_us(self.chain.decoder,
+                                                                         round(target * 1e6))
                     if code:
+                        if getattr(self.chain, 'prores_input', False):
+                            raise RuntimeError(f'ProRes seek failed ({code})')
                         gtx._bridge_error(self.bridges['nvdec'], 'nvdec_bridge_last_error', code)
                 self.decoder_reused = False
                 while True:
                     frame = gtx._DeviceFrame(struct_size=C.sizeof(gtx._DeviceFrame))
                     code = self.chain.next_frame(frame)
                     if code < 0:
+                        if getattr(self.chain, 'prores_input', False):
+                            raise RuntimeError(f'ProRes decode failed ({code})')
                         gtx._bridge_error(self.bridges['nvdec'], 'nvdec_bridge_last_error', code)
                     if not code:
                         raise ValueError('preview reached end of source')
@@ -1073,6 +1136,11 @@ class GpuPreview:
             source_cached = getattr(self, 'source_display_cache', None)
             source_bgr = None
             native_report = None
+            if getattr(self,'_capture_frame_source',False):
+                from image_render import download
+                source = (outcome['_preview_master'] if self.hdr or self.sdr10
+                          else self.chain._preview_original_color)
+                self._captured_frame_source = download(dict(source,output_hdr=self.hdr),frame)
             if self.native_display:
                 source = (outcome['_preview_master'] if self.hdr or self.sdr10
                           else self.chain._preview_original_color)

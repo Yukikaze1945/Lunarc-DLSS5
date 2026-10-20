@@ -14,6 +14,7 @@ Cases, both directions, for decoder-side reads and encoder-side writes:
 """
 
 import os
+import io
 import subprocess
 import sys
 import threading
@@ -80,6 +81,119 @@ def test_unexpected_decoder_exit_without_cancel_raises_runtime_error():
         "a real decoder failure must not be relabelled as a cancellation"
     proc.stdout.close()
     proc.stderr.close()
+
+
+def test_decoder_timeout_after_partial_pipe_data_kills_and_reaps_child():
+    proc = _spawn("import sys,time; sys.stdout.buffer.write(b'partial'); sys.stdout.flush(); time.sleep(10)")
+    started = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match="超时"):
+            pipeline._read_exactly(proc.stdout, 128, proc=proc, timeout=0.2,
+                                   what="stalled integration child")
+        assert time.monotonic() - started < 1.0
+        assert proc.poll() is not None, "timed-out child must be reaped"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=2)
+        proc.stdout.close()
+        proc.stderr.close()
+
+
+def test_decoder_pipe_reads_final_payload_after_fast_normal_exit():
+    payload = b"final-pipe-payload"
+    source = "import os; os.write(1, %r)" % payload
+    proc = _spawn(source)
+    try:
+        assert pipeline._read_exactly(proc.stdout, len(payload), proc=proc,
+                                      timeout=2, what="fast-exit payload") == payload
+        assert proc.wait(timeout=2) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=2)
+        proc.stdout.close()
+        proc.stderr.close()
+
+
+def test_decoder_reuses_one_reader_across_frame_boundaries_and_releases_it():
+    payload = bytes(range(128))
+    proc = _spawn("import os; os.write(1, %r)" % payload)
+    try:
+        first = pipeline._read_exactly(proc.stdout, 17, proc=proc, timeout=2)
+        reader = proc._lunarc_decoder_pipe_reader
+        second = pipeline._read_exactly(proc.stdout, 111, proc=proc, timeout=2)
+        assert first + second == payload
+        assert proc._lunarc_decoder_pipe_reader is reader
+        assert proc.wait(timeout=2) == 0
+    finally:
+        pipeline._close_decoder_process(proc)
+    assert not reader.thread.is_alive()
+
+
+@pytest.mark.parametrize('complete', [False, True])
+def test_input_decode_probe_reaps_child_and_closes_pipes(monkeypatch, complete):
+    # Exercise lifecycle only; no CUDA or FFmpeg is used by this test.
+    proc = _spawn(HANG_CHILD)
+    monkeypatch.setattr(pipeline, 'probe_cuda_decode_support', lambda _: (True, 'fixture'))
+    monkeypatch.setattr(pipeline, 'video_info', lambda _: (1, 30, 1, 1))
+    monkeypatch.setattr(pipeline.subprocess, 'Popen', lambda *args, **kwargs: proc)
+    monkeypatch.setattr(pipeline, '_popen_read_first',
+                        lambda *args, **kwargs: b'123' if complete else b'')
+    stderr = proc.stderr
+
+    class CheckedStderr:
+        def read(self):
+            assert proc.poll() is not None, 'stderr must not be read from a live probe'
+            return stderr.read()
+
+        def close(self):
+            stderr.close()
+
+    proc.stderr = CheckedStderr()
+    try:
+        result = pipeline.probe_cuda_decode_for_input('fixture', ffmpeg='fixture')
+        assert result[0] is complete
+        assert proc.poll() is not None
+        assert proc.stdout.closed and stderr.closed
+    finally:
+        pipeline._close_decoder_process(proc)
+
+
+def test_decoder_pipe_cancel_while_child_stalls_is_bounded_and_reaped():
+    proc = _spawn(HANG_CHILD)
+    stop_event = threading.Event()
+    result = {}
+
+    def read():
+        try:
+            pipeline._read_exactly(proc.stdout, 64, proc=proc, stop_event=stop_event,
+                                   timeout=5, what="cancelled stalled child")
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=read, daemon=True)
+    thread.start()
+    time.sleep(0.1)
+    started = time.monotonic()
+    stop_event.set()
+    thread.join(timeout=1)
+    try:
+        assert not thread.is_alive(), "cancelled pipe reader did not return"
+        assert isinstance(result.get("error"), pipeline.JobCancelled)
+        assert time.monotonic() - started < 1
+        assert proc.poll() is not None, "cancelled child must be reaped"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=2)
+        proc.stdout.close()
+        proc.stderr.close()
+
+
+def test_read_exactly_supports_memory_stream_and_graceful_eof():
+    assert pipeline._read_exactly(io.BytesIO(b"abcd"), 4) == b"abcd"
+    assert pipeline._read_exactly(io.BytesIO(b"xy"), 4) == b"xy"
 
 
 def _write_to_dead_encoder(cancelled):

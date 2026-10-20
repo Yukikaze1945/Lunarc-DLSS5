@@ -145,6 +145,9 @@ def _identity_chain(uses_flow, live):
                       (30000, 1001), 1.0, (3840, 2160), None,
                       downscaled=False, tap_plans=None, uses_flow=uses_flow)
     chain.first = False
+    # This routing fixture has no scene-observation device; that stage is tested separately.
+    from temporal_control import GpuTemporalControl, TemporalControls
+    chain.temporal_control = GpuTemporalControl(TemporalControls(scene_detection=False))
     return chain, nvenc
 
 
@@ -1560,6 +1563,8 @@ def _run_chain(downscaled, src=(3840, 2160), plan_driven=False):
     frame.y_pitch_bytes, frame.uv_pitch_bytes = 7680, 7680
     frame.cuda_context, frame.pts = 0x5, 7
     frame.time_base_num, frame.time_base_den = 1, 1001
+    from temporal_control import GpuTemporalControl, TemporalControls
+    chain.temporal_control = GpuTemporalControl(TemporalControls(scene_detection=False))
     chain._open_color_stages(frame)
     outcome = chain.process(frame, flow, 0, True)
     return chain, calls, flow, outcome
