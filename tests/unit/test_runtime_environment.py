@@ -10,6 +10,12 @@ import pytest
 import runtime_environment as env
 
 
+@pytest.fixture(autouse=True)
+def isolated_runtime_selection(monkeypatch):
+    # Unit checks must not inspect the developer's selected model/cache links.
+    monkeypatch.setattr('dlssnr_runtime.selection_key', lambda: ('fixture-cache', None))
+
+
 def test_bootstrap_explains_broken_native_import(monkeypatch):
     def load(name):
         if name == 'cv2':
