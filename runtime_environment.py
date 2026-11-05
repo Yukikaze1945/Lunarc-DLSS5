@@ -41,6 +41,7 @@ BRIDGES = {
     'gpu_hdr_scrgb_bridge.dll': ('gpu_hdr_abi_version', 1),
     'gpu_preview_readback.dll': ('gpu_preview_open', None),
     'gpu_preview_display.dll': ('gpu_preview_display_open', None),
+    'gpu_native_presenter.dll': ('gpu_native_presenter_open', None),
     'gpu_rgba_exchange.dll': ('gpu_rgba_exchange_open', None),
     'rtx_vsr_bridge.dll': ('rtx_vsr_abi_version', 1),
     'fidelityfx_flow_bridge.dll': ('ffx_flow_abi_version', 1),
@@ -273,6 +274,7 @@ def worker():
     for key, label, deps in [
         ('dlssnr', 'DLSSNR', ['cuda', 'driver', 'dlss_gpu_host.dll', 'dlssnr_runtime']),
         ('gpu_transfer', 'GPU 解码与编码', base),
+        ('preview', 'GPU 预览', ['cuda', 'gpu_native_presenter.dll', 'gpu_rgba_exchange.dll']),
         ('hdr', '10-bit / HDR', base + ['gpu_hdr_scrgb_bridge.dll']),
         ('fidelityfx', 'AMD 光流', ['cuda', 'fidelityfx_flow_bridge.dll']),
         ('nvof', 'NVIDIA 光流', ['driver', 'nvof_bridge.dll', 'nvof_d3d12_interop.dll']),

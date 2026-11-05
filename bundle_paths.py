@@ -51,6 +51,7 @@ NATIVE_BINARIES = (
     "gpu_hdr_scrgb_bridge.dll",  # HDR10: P010 -> scRGB FP16 -> P010 colour bridge
     "gpu_preview_readback.dll", # Explicit display-only readback
     "gpu_preview_display.dll",  # GPU display resampling before viewport readback
+    "gpu_native_presenter.dll", # Workbench FP16/scRGB native preview window
     "gpu_export_resize.dll",    # Final export resize; RGBA8 or signed FP16
     "gpu_rgba_exchange.dll",    # GPU resources for native output effects
     "rtx_vsr_bridge.dll",       # Adapter; licensed NVIDIA runtime stays external

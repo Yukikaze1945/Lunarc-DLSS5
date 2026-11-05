@@ -12,5 +12,7 @@ module.exports=async function(){
   }
   for(const name of ['component-tools/uv.exe','components/base.lock','components/raft.lock','components/raft-model.json','components/raft-wheel.json','native-deps/avcodec-61.dll'])
     if(!manifest.files[name])throw Error(`Incomplete manifest: ${name}`)
+  const presenter=path.resolve(__dirname,'../../native/gpu_native_presenter.dll')
+  if(!fs.existsSync(presenter))throw Error('Missing required native/gpu_native_presenter.dll; run native/build_gpu_native_presenter.bat before packaging')
   console.log('Small installer resources verified; AI runtime is downloaded separately')
 }

@@ -58,7 +58,6 @@ extraResources:
       - "native/*.dll"
       - "!native/nvdec_bridge_p010.dll"
       - "!native/nvenc_bridge_sdr10.dll"
-      - "!native/gpu_native_presenter.dll"
   - from: "../build/small-resources"
     to: "."
     filter:
