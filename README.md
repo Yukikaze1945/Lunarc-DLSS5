@@ -13,7 +13,7 @@
 
 Lunarc 使用 DLSS 5（DLSS5 / DLSSNR）神经渲染增强视频与图片，支持 DLAA、RTX VSR、NVIDIA VFG 补帧、TrueHDR SDR 转 HDR，以及独立图片放大与导出。
 
-[下载安装版](https://github.com/Yukikaze1945/Lunarc-DLSS5/releases/tag/v1.4.0) &nbsp; / &nbsp; [功能手册](docs/user-guide.md) &nbsp; / &nbsp; [官方网站](https://lunarc-workbench.defaddg-9590.chatgpt.site/) &nbsp; / &nbsp; [安装说明](docs/installing.md) &nbsp; / &nbsp; [源码运行](docs/getting-started.md)
+[下载安装版](https://github.com/Yukikaze1945/Lunarc-DLSS5/releases/tag/v1.4.1) &nbsp; / &nbsp; [功能手册](docs/user-guide.md) &nbsp; / &nbsp; [官方网站](https://lunarc-workbench.defaddg-9590.chatgpt.site/) &nbsp; / &nbsp; [安装说明](docs/installing.md) &nbsp; / &nbsp; [源码运行](docs/getting-started.md)
 
 本文介绍当前源码；安装版功能请以对应发行说明为准。
 
@@ -43,7 +43,7 @@ Lunarc 使用 DLSS 5（DLSS5 / DLSSNR）神经渲染增强视频与图片，支�
 
 ## 03 / 安装
 
-1. 在 [Releases](https://github.com/Yukikaze1945/Lunarc-DLSS5/releases/tag/v1.4.0) 下载并运行 `Lunarc-1.4.0-x64-Setup.exe`。
+1. 在 [Releases](https://github.com/Yukikaze1945/Lunarc-DLSS5/releases/tag/v1.4.1) 下载并运行 `Lunarc-1.4.1-x64-Setup.exe`。
 2. 首次启动按提示安装基础运行环境和视频处理组件。
 3. 在 **运行与诊断 → DLSSNR 运行库** 中下载或导入运行库，校验后自动选用。
 
